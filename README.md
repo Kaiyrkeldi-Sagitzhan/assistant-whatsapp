@@ -1,0 +1,179 @@
+# Task Assistant (Python)
+
+Production-oriented backend for a personal task assistant that ingests events from WhatsApp, email, and calendar, then builds agendas and reminders.
+
+**Status**: Phase 0-1 complete (foundation + data layer). Phase 2-7 in progress (integrations, NLP, task core, reminders, observability).
+
+## Features
+
+- **WhatsApp Bot**: Receive tasks in natural language, get confirmations and reminders.
+- **Email Integration**: Forward emails with context; system extracts tasks and deadlines.
+- **Calendar Sync**: Track busy time, recommend slots, link tasks to meetings.
+- **AI Extraction**: Gemini-powered NLP to parse Russian/English task descriptions.
+- **Task Management**: Create, update, reschedule, complete, tag, and link tasks.
+- **Smart Reminders**: Exact time, before deadline, morning digest, overdue alerts.
+- **Day/Week Agenda**: Unified view of meetings, deadlines, critical tasks, and recommendations.
+
+## Stack
+
+- **Backend**: FastAPI (Python 3.11+)
+- **Database**: PostgreSQL + SQLAlchemy ORM + Alembic
+- **Queue**: Redis + Celery + Beat scheduler
+- **AI**: Gemini API (text understanding)
+- **APIs**: Meta WhatsApp Cloud, Google Calendar, Email providers
+
+## Quick Start
+
+### Docker Compose (Recommended)
+
+```bash
+git clone <repo>
+cd Rustam
+cp .env.example .env
+# Edit .env with your credentials (Gemini API key, WhatsApp tokens, etc.)
+docker compose up
+```
+
+Health check:
+```bash
+curl http://localhost:8000/healthz
+```
+
+### Local Development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for detailed setup instructions.
+
+## Project Structure
+
+```
+app/
+├── api/              # API endpoints (webhooks, tasks, agenda)
+├── core/             # Config, logging, constants
+├── db/               # Database models, session
+├── integrations/     # External API clients (WhatsApp, email, calendar)
+├── schemas/          # Request/response schemas
+├── services/         # Business logic (tasks, NLP, agenda, reminders)
+├── workers/          # Celery tasks, Beat schedules
+└── main.py           # FastAPI app entry
+
+alembic/              # Database migrations
+tests/                # Unit + integration tests
+.github/workflows/    # CI/CD pipelines
+
+docs/                 # Technical specification
+docker-compose.yml    # Local infrastructure
+Dockerfile            # Production image
+pyproject.toml        # Dependencies + tooling
+```
+
+## Key Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/healthz` | Health check |
+| GET/POST | `/webhooks/whatsapp` | Meta WhatsApp Cloud API webhook |
+| POST | `/webhooks/email` | Email inbound processor |
+| POST | `/webhooks/calendar` | Calendar event sync |
+| POST | `/tasks` | Create task |
+| PATCH | `/tasks/{id}` | Update task |
+| POST | `/tasks/{id}/complete` | Mark task done |
+| GET | `/tasks/open/{user_id}` | List open tasks |
+| GET | `/agenda/day` | Day agenda |
+| GET | `/agenda/week` | Week agenda |
+
+## How To Use The Assistant
+
+The backend provides three interaction paths:
+
+1. Direct API calls for manual task and agenda management.
+2. WhatsApp, email, and calendar webhooks for automatic ingestion.
+3. Async processing through Celery workers for NLP and reminder jobs.
+
+After startup, open interactive API docs at:
+
+- `http://localhost:8000/docs` (Swagger UI)
+- `http://localhost:8000/redoc` (ReDoc)
+
+Typical flow:
+
+1. Send user input through `/webhooks/whatsapp` or `/webhooks/email`.
+2. Worker parses the message and creates/updates tasks.
+3. Read current state via `/tasks/open/{user_id}`, `/agenda/day`, or `/agenda/week`.
+
+## Environment (.env)
+
+```bash
+# App
+APP_ENV=dev
+APP_TIMEZONE=Asia/Almaty
+
+# API Keys
+GEMINI_API_KEY=your_gemini_key
+WHATSAPP_VERIFY_TOKEN=your_verify_token
+WHATSAPP_ACCESS_TOKEN=your_access_token
+WHATSAPP_PHONE_NUMBER_ID=your_phone_id
+GOOGLE_CALENDAR_CLIENT_ID=your_client_id
+GOOGLE_CALENDAR_CLIENT_SECRET=your_secret
+EMAIL_INBOUND_SECRET=your_secret
+
+# Databases
+DATABASE_URL=postgresql+psycopg://assistant:assistant@localhost:5432/assistant
+REDIS_URL=redis://localhost:6379/0
+```
+
+Copy `.env.example` to `.env` and fill in your credentials.
+
+## Testing
+
+```bash
+# All tests
+pytest
+
+# With coverage
+pytest --cov=app tests/
+
+# Specific test file
+pytest tests/test_health.py -v
+```
+
+## Development
+
+```bash
+# Code style
+ruff check app tests
+ruff format app tests
+
+# Type checking
+mypy app
+
+# Database migrations
+alembic revision --autogenerate -m "Description"
+alembic upgrade head
+```
+
+## Deployment
+
+### Production Docker Build
+
+```bash
+docker build -t task-assistant:prod .
+docker run --env-file .env.prod -p 8000:8000 task-assistant:prod
+```
+
+### Environment-Specific Configs
+
+- `dev`: Local development with debug logging
+- `stage`: Staging with reduced logging
+- `prod`: Production with error tracking, metrics
+
+## Technical Specification
+
+Full requirements, architecture, NLP pipeline, and acceptance criteria are in:
+[docs/ai-assistant-tech-spec.md](docs/ai-assistant-tech-spec.md)
+
+## Support
+
+- **Issues**: Check GitHub Issues
+- **Docs**: See [DEVELOPMENT.md](DEVELOPMENT.md)
+- **Spec**: See [docs/ai-assistant-tech-spec.md](docs/ai-assistant-tech-spec.md)
+
