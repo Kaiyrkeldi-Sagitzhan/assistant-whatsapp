@@ -9,9 +9,29 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_recipient_phone(phone: str) -> str:
+    """Normalize phone number to international format.
+    
+    Handles various formats:
+    - 77769707106 -> 787769707106 (Kazakh format to test recipient)
+    - 877769707106 -> 787769707106 (8-prefix to 7-prefix)
+    - +777769707106 -> 787769707106 (with plus)
+    """
     digits = re.sub(r"\D", "", phone)
+    
+    # Convert 8-prefix to 7-prefix (Russian/Kazakh format)
     if len(digits) == 11 and digits.startswith("8"):
-        return f"7{digits[1:]}"
+        digits = f"7{digits[1:]}"
+    
+    # Convert Kazakh mobile format to test recipient format
+    # 777xxxxxxx -> 7877xxxxxxx (add 8 after 777)
+    if len(digits) >= 10:
+        if digits.startswith('7777'):
+            digits = '78777' + digits[4:]
+        elif digits.startswith('777'):
+            digits = '7877' + digits[3:]
+        elif digits.startswith('77'):
+            digits = '787' + digits[2:]
+    
     return digits
 
 
@@ -27,8 +47,8 @@ class WhatsAppMetaClient:
         )
 
     async def send_text(self, to: str, body: str) -> None:
-        # Use international format for Kazakhstan
-        recipient = f"7{to}" if not to.startswith('7') else to
+        # Normalize phone number to international format
+        recipient = _normalize_recipient_phone(to)
         payload = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",

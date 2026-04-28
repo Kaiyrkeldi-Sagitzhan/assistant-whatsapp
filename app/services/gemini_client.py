@@ -31,6 +31,7 @@ User timezone: Asia/Almaty (UTC+5/6)
 CRITICAL INTENT CLASSIFICATION:
 - create_task: ONLY messages that clearly contain tasks, todos, reminders, or work items that need to be done
 - create_event: ONLY calendar events, meetings, appointments with specific time mentioned
+- schedule_notification: User wants to set a custom reminder/notification
 - unknown: ALL other messages including greetings, questions, status requests, empty messages, unclear text
 
 EXAMPLES OF "unknown" intent (MUST return unknown):
@@ -55,7 +56,13 @@ EXAMPLES OF "create_event" intent:
 - "Совещание в понедельник 10:00" → create_event
 - "Звонок в 14:30" → create_event
 
-DATETIME EXTRACTION (only for create_task/create_event):
+EXAMPLES OF "schedule_notification" intent:
+- "Напомни через 1 минуту" → schedule_notification
+- "Уведоми меня в 15:00" → schedule_notification
+- "Напомни завтра в 10 утра" → schedule_notification
+- "Через 30 минут напомни" → schedule_notification
+
+DATETIME EXTRACTION (only for create_task/create_event/schedule_notification):
 - Kazakh time formats: "15 00", "15:00", "3 часа дня"
 - Relative dates: завтра=tomorrow, послезавтра=day after tomorrow
 - Days: понедельник=Monday, вторник=Tuesday, etc.
@@ -76,14 +83,14 @@ STRICT RULES:
 
 RESPONSE FORMAT:
 {{
-  "intent": "create_task|create_event|unknown",
+  "intent": "create_task|create_event|schedule_notification|unknown",
   "title": "short task title (empty for unknown)",
   "datetime": "2026-04-22T15:00:00 (null for unknown)",
   "description": "full message text"
 }}
 
 Message: "{text}"
-        """
+         """
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
@@ -118,3 +125,43 @@ Message: "{text}"
                 "datetime": None,
                 "description": text,
             }
+
+    async def chat(self, text: str, timezone: str = "Asia/Almaty") -> str:
+        """Generate a conversational response for general messages."""
+        current_date = now_utc().strftime("%Y-%m-%d")
+        prompt = f"""
+You are a friendly AI assistant for task management in Kazakhstan. 
+Respond naturally to the user's message in Russian. Keep responses concise and helpful.
+
+Current date: {current_date}
+User timezone: {timezone}
+
+Guidelines:
+- Be friendly and conversational
+- If the user says thanks, acknowledge it warmly
+- If the user asks about your capabilities, mention task management features
+- Keep responses short (1-3 sentences)
+- Use emojis occasionally to be engaging
+- If asked about tasks, mention you can create, list, and complete tasks
+
+User message: "{text}"
+
+Respond naturally in Russian:
+"""
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.7,
+            },
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(self.url, json=body)
+                response.raise_for_status()
+            payload = response.json()
+            raw = payload["candidates"][0]["content"]["parts"][0]["text"]
+            return raw.strip()
+        except Exception as exc:
+            logger.exception("Gemini chat failed: %s", exc)
+            return "Извините, произошла ошибка. Пожалуйста, попробуйте позже. 😔"

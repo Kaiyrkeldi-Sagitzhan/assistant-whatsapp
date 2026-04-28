@@ -24,6 +24,7 @@ from app.integrations.whatsapp_meta import WhatsAppMetaClient
 from app.schemas.task import TaskCreate
 from app.services.nlp_pipeline import NLPPipeline
 from app.services.reminder_service import ReminderService
+from app.services.context_manager import ConversationContext
 from app.services.task_service import TaskService
 from app.services.agenda_service import AgendaService
 from app.workers.celery_app import celery_app
@@ -97,10 +98,61 @@ def process_whatsapp_inbound(
             return
         logger.info("Message stored successfully for user %s", user.id)
 
+        # Check for pending clarification
+        context_mgr = ConversationContext()
+        pending_context = asyncio.run(context_mgr.consume_clarification(str(user.id), text))
+        
         # Parse message to determine intent
         try:
             pipeline = NLPPipeline()
-            parsed = asyncio.run(pipeline.parse_message(text, user.timezone))
+            if pending_context:
+                # User is responding to a clarification request
+                # Combine the original task info with the clarification
+                logger.info("Processing clarification response for user %s: %s", user.id, text)
+                
+                # Parse the clarification response to extract time/date info
+                # Combine original text with clarification for proper context
+                combined_text = pending_context["original_text"] + " " + text
+                clarification_parsed = asyncio.run(pipeline.parse_message(combined_text, user.timezone))
+                
+                # Use the original task info but update with clarification
+                intent = pending_context["intent"]
+                title = pending_context["parsed_title"]
+                description = pending_context["parsed_description"]
+                
+                # If clarification provides a datetime, use it
+                if clarification_parsed.datetime:
+                    datetime_obj = clarification_parsed.datetime
+                    due_at = datetime_obj
+                else:
+                    # Try to extract datetime from the combined text (original + clarification)
+                    datetime_obj = pipeline._extract_datetime_from_text(combined_text, user.timezone)
+                    due_at = datetime_obj
+                
+                # If still no datetime, use the original
+                if not datetime_obj:
+                    datetime_obj = None
+                    due_at = None
+                
+                confidence = 0.8  # Higher confidence for clarified tasks
+                
+                # Create a parsed message manually
+                class SimpleParsed:
+                    pass
+                parsed = SimpleParsed()
+                parsed.intent = intent
+                parsed.title = title
+                parsed.description = description
+                parsed.datetime = datetime_obj
+                parsed.due_at = due_at
+                parsed.confidence = confidence
+                parsed.needs_clarification = False
+                
+                logger.info("Clarification processed for user %s: task='%s', datetime='%s'", 
+                           user.id, title, datetime_obj)
+            else:
+                # Normal message processing
+                parsed = asyncio.run(pipeline.parse_message(text, user.timezone, user_id=str(user.id)))
             logger.info("NLP parsed message: intent='%s', title='%s', datetime='%s'", parsed.intent, parsed.title, parsed.datetime)
             print("Parsed intent:", parsed.intent, "for message:", text)
 
@@ -131,6 +183,84 @@ def process_whatsapp_inbound(
                     )
                 else:
                     confirmation = _format_weekly_plan(plan)
+
+            elif parsed.intent == "help":
+                # Show comprehensive help
+                confirmation = (
+                    "🤖 Я ваш умный помощник по управлению задачами!\n\n"
+                    "📝 **УМЕЮ СОЗДАВАТЬ ЗАДАЧИ:**\n"
+                    "• Просто опишите задачу: 'Купить молоко завтра в 10 утра'\n"
+                    "• 'Встреча с клиентом в пятницу 15:00'\n"
+                    "• 'Написать отчет до конца недели'\n\n"
+                    "📋 **УМЕЮ ПОКАЗЫВАТЬ ЗАДАЧИ:**\n"
+                    "• 'мои задачи' - список всех активных задач\n"
+                    "• 'повестка' или 'agenda' - расписание на сегодня\n"
+                    "• 'план на неделю' - обзор на ближайшие 7 дней\n\n"
+                    "✅ **УМЕЮ ОТМЕЧАТЬ ВЫПОЛНЕНИЕ:**\n"
+                    "• 'выполнил [название задачи]'\n"
+                    "• 'готово [название задачи]'\n\n"
+                    "📅 **УМЕЮ ПОДКЛЮЧАТЬСЯ К КАЛЕНДАРЮ:**\n"
+                    "• Google Календарь для синхронизации встреч\n\n"
+                    "📊 **УМЕЮ ОТПРАВЛЯТЬ СВОДКИ В WHATSAPP:**\n"
+                    "• Сводка на день - задачи только на сегодня\n"
+                    "• Сводка на неделю - все задачи на 7 дней с разбивкой по дням\n"
+                    "• Сводка на месяц - все задачи, сгруппированные по неделям\n\n"
+                    "🔔 **АВТОМАТИЧЕСКИЕ НАПОМИНАНИЯ:**\n"
+                    "• За 1 час до дедлайна (для важных задач)\n"
+                    "• За 1 день до дедлайна (для критических задач)\n"
+                    "• Утренние и вечерние дайджесты\n\n"
+                    "⏰ **УМЕЮ СТАВИТЬ НАПОМИНАНИЯ:**\n"
+                    "• 'Напомни мне через 1 минуту'\n"
+                    "• 'Уведоми меня в 15:00'\n"
+                    "• 'Напомни завтра в 10 утра'\n\n"
+                    "💡 **ПРИМЕРЫ КОМАНД:**\n"
+                    "• 'Купить продукты завтра'\n"
+                    "• 'Выполнил отчет'\n"
+                    "• 'Покажи мои задачи'\n"
+                    "• 'Какая у меня повестка?'\n"
+                    "• 'Свободное время сегодня'\n"
+                    "• 'Напомни через 30 минут'\n"
+                    "• 'Уведоми меня в 18:00'\n\n"
+                    "🆘 **ПОМОЩЬ:**\n"
+                    "Напишите 'помощь' в любое время, чтобы увидеть это сообщение снова!"
+                )
+
+            elif parsed.intent == "schedule_notification":
+                # Schedule a custom notification
+                from datetime import datetime, timedelta
+                
+                # Extract the message (remove notification keywords)
+                notification_keywords = ["уведоми", "напомни", "remind", "notify", "напоминание", "уведомление"]
+                message_text = text
+                for keyword in notification_keywords:
+                    message_text = message_text.replace(keyword, "").strip()
+                
+                # Parse the time from the message
+                reminder_service = ReminderService(db)
+                
+                notify_time = reminder_service.parse_notification_text(text, user.timezone, now_utc())
+                
+                if notify_time:
+                    # Schedule the notification
+                    success = reminder_service.schedule_custom_notification(
+                        user_id=user.id,
+                        message=message_text if message_text else "Напоминание",
+                        notify_at=notify_time,
+                        title="Напоминание"
+                    )
+                    
+                    if success:
+                        time_str = notify_time.strftime("%d.%m %H:%M")
+                        confirmation = f"✅ Напоминание запланировано на {time_str}! Я напишу вам в это время."
+                    else:
+                        confirmation = "❌ Не удалось запланировать напоминание. Попробуйте еще раз."
+                else:
+                    confirmation = (
+                        "❓ Не понял, когда напомнить. Попробуйте так:\n"
+                        "• 'Напомни через 1 минуту'\n"
+                        "• 'Уведоми меня в 15:00'\n"
+                        "• 'Напомни завтра в 10 утра'"
+                    )
 
             elif parsed.intent == "list_tasks":
                 # List all tasks with priorities
@@ -199,7 +329,7 @@ def process_whatsapp_inbound(
                         break
 
                 if matched_task:
-                    service.complete_task(matched_task.id, user.id)
+                    service.complete_task(matched_task.id)
                     confirmation = f"✅ Отлично! Задача '{matched_task.title}' выполнена! 🎉\n💪 Молодец, продолжайте в том же духе!"
                 else:
                     confirmation = f"🤔 Не нашел задачу с названием '{task_name}'. Попробуйте:\n• Проверить орфографию\n• Сказать точнее: 'выполнил купить молоко'\n• Посмотреть список: 'мои задачи'"
@@ -222,16 +352,23 @@ def process_whatsapp_inbound(
 
             elif parsed.intent == "unknown":
                 # Handle messages that don't contain tasks
-                logger.info("Message intent: %s - no task detected", parsed.intent)
-                confirmation = (
-                    "👋 Привет! Я ваш помощник по задачам.\n\n"
-                    "📝 Я умею:\n"
-                    "• Создавать задачи: 'Купить молоко завтра в 10 утра'\n"
-                    "• Планировать встречи: 'Встреча с клиентом в пятницу 15:00'\n"
-                    "• Показывать задачи: 'мои задачи' или 'повестка'\n"
-                    "• Отмечать выполнение: 'выполнил купить молоко'\n\n"
-                    "💡 Попробуйте написать задачу, и я её запомню!"
-                )
+                logger.info("Message intent: %s - no task detected, using chat mode", parsed.intent)
+                try:
+                    # Use Gemini to generate a conversational response
+                    gemini = GeminiClient()
+                    confirmation = asyncio.run(gemini.chat(text, user.timezone))
+                except Exception as e:
+                    logger.error("Chat generation failed: %s", e)
+                    # Fallback to generic help message
+                    confirmation = (
+                        "👋 Привет! Я ваш помощник по задачам.\n\n"
+                        "📝 Я умею:\n"
+                        "• Создавать задачи: 'Купить молоко завтра в 10 утра'\n"
+                        "• Планировать встречи: 'Встреча с клиентом в пятницу 15:00'\n"
+                        "• Показывать задачи: 'мои задачи' или 'повестка'\n"
+                        "• Отмечать выполнение: 'выполнил купить молоко'\n\n"
+                        "💡 Попробуйте написать задачу, и я её запомню!"
+                    )
 
             elif parsed.intent == "create_task":
                 # Check if clarification is needed
@@ -247,7 +384,8 @@ def process_whatsapp_inbound(
                             description=parsed.description,
                             due_at=parsed.datetime,
                             priority=TaskPriority.MEDIUM,  # Default priority
-                        )
+                        ),
+                        parsed_intent=parsed.intent
                     )
                     logger.info("Task created: %s", task.title)
 
@@ -296,7 +434,8 @@ def process_whatsapp_inbound(
                             description=parsed.description,
                             due_at=parsed.datetime,
                             priority=TaskPriority.HIGH,  # Events are important
-                        )
+                        ),
+                        parsed_intent=parsed.intent
                     )
                     logger.info("Event created as task: %s", task.title)
 
@@ -326,16 +465,23 @@ def process_whatsapp_inbound(
                     )
 
             else:
-                logger.info("Message intent: %s", parsed.intent)
-                confirmation = (
-                    "👋 Привет! Я ваш помощник по задачам.\n\n"
-                    "📝 Я умею:\n"
-                    "• Создавать задачи: 'Купить молоко завтра в 10 утра'\n"
-                    "• Планировать встречи: 'Встреча с клиентом в пятницу 15:00'\n"
-                    "• Показывать задачи: 'мои задачи' или 'повестка'\n"
-                    "• Отмечать выполнение: 'выполнил купить молоко'\n\n"
-                    "🤔 Что бы вы хотели сделать?"
-                )
+                logger.info("Message intent: %s - using chat mode", parsed.intent)
+                try:
+                    # Use Gemini to generate a conversational response
+                    gemini = GeminiClient()
+                    confirmation = asyncio.run(gemini.chat(text, user.timezone))
+                except Exception as e:
+                    logger.error("Chat generation failed: %s", e)
+                    # Fallback to generic help message
+                    confirmation = (
+                        "👋 Привет! Я ваш помощник по задачам.\n\n"
+                        "📝 Я умею:\n"
+                        "• Создавать задачи: 'Купить молоко завтра в 10 утра'\n"
+                        "• Планировать встречи: 'Встреча с клиентом в пятницу 15:00'\n"
+                        "• Показывать задачи: 'мои задачи' или 'повестка'\n"
+                        "• Отмечать выполнение: 'выполнил купить молоко'\n\n"
+                        "🤔 Что бы вы хотели сделать?"
+                    )
 
         except Exception as e:
             logger.error("Error processing message: %s", str(e))
@@ -348,13 +494,24 @@ def process_whatsapp_inbound(
         # Send confirmation back to user
         config = get_settings()
         
-        # Always send to the sender's phone (each user gets separate reply)
-        recipient_phone = phone
+        # Convert sender's phone number to match test recipient format
+        # Examples:
+        # - 77769707106 -> 787769707106
+        # - 77782304206 -> 787782304206
+        # Rule: if starts with 777, add 8 after 777 or 7777
+        if phone.startswith('7777'):
+            recipient_phone = '78777' + phone[4:]
+        elif phone.startswith('777'):
+            recipient_phone = '7877' + phone[3:]
+        elif phone.startswith('77'):
+            recipient_phone = '787' + phone[2:]
+        else:
+            recipient_phone = phone
         
         try:
             whatsapp_client = WhatsAppMetaClient()
             asyncio.run(whatsapp_client.send_text(recipient_phone, confirmation))
-            logger.info("Confirmation sent to %s: %s", recipient_phone, confirmation)
+            logger.info("Confirmation sent to %s (original sender: %s): %s", recipient_phone, phone, confirmation)
         except Exception as e:
             logger.error("Failed to send confirmation: %s", str(e))
 

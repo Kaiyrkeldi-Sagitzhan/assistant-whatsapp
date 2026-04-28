@@ -9,6 +9,7 @@ from dateutil.relativedelta import relativedelta  # type: ignore[import-untyped]
 
 from app.core.time import now_utc, resolve_timezone, to_utc
 from app.services.gemini_client import GeminiClient
+from app.services.context_manager import ConversationContext
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class NLPPipeline:
     def __init__(self) -> None:
         self.gemini = GeminiClient()
 
-    async def parse_message(self, text: str, timezone: str) -> ParsedMessage:
+    async def parse_message(self, text: str, timezone: str, user_id: Union[str, None] = None) -> ParsedMessage:
         # First check for rule-based intents (commands)
         intent = self._detect_intent(text)
 
@@ -53,6 +54,15 @@ class NLPPipeline:
                 description=text,
                 confidence=0.8,
             )
+        elif intent == "schedule_notification":
+            # Custom notification scheduling
+            return ParsedMessage(
+                intent=intent,
+                title="",
+                datetime=None,
+                description=text,
+                confidence=0.9,
+            )
         else:
             # First try rule-based time extraction for better accuracy
             rule_datetime = self._extract_datetime_from_text(text, timezone)
@@ -72,7 +82,7 @@ class NLPPipeline:
                     # Check if text looks like a task using rule-based parsing
                     if rule_datetime or self._looks_like_task(text):
                         # Treat as create_task but ask for clarification
-                        title = text.strip()[:50]
+                        title = self._clean_title(text.strip()[:50])
                         description = text
                         confidence = float(extracted.get("confidence", 0.5))
                         datetime_obj = rule_datetime
@@ -110,7 +120,7 @@ class NLPPipeline:
                             confidence=float(extracted.get("confidence", 0.9)),
                         )
 
-                title = str(extracted.get("title", text.strip()[:50]))
+                title = self._clean_title(str(extracted.get("title", text.strip()[:50])))
                 datetime_str = extracted.get("datetime")
                 description = str(extracted.get("description", text))
                 confidence = float(extracted.get("confidence", 0.5))
@@ -127,7 +137,7 @@ class NLPPipeline:
                 # Fallback to rule-based parsing when Gemini is unavailable
                 logger.warning("Gemini API timeout, using rule-based fallback for: %s", text)
                 intent = "create_task"
-                title = text.strip()[:50]
+                title = self._clean_title(text.strip()[:50])
                 description = text
                 confidence = 0.3
                 datetime_obj = rule_datetime
@@ -135,7 +145,7 @@ class NLPPipeline:
                 # Fallback for any other Gemini errors
                 logger.warning("Gemini API error (%s), using rule-based fallback for: %s", e, text)
                 intent = "create_task"
-                title = text.strip()[:50]
+                title = self._clean_title(text.strip()[:50])
                 description = text
                 confidence = 0.3
                 datetime_obj = rule_datetime
@@ -143,6 +153,18 @@ class NLPPipeline:
             # Check if clarification is needed
             clarification = self._check_needs_clarification(title, datetime_obj, text, intent)
             if clarification:
+                # Store context for follow-up
+                if user_id:
+                    context_mgr = ConversationContext()
+                    await context_mgr.set_pending_clarification(
+                        user_id=user_id,
+                        original_text=text,
+                        parsed_title=title,
+                        parsed_description=description,
+                        clarification_type=clarification["type"],
+                        clarification_question=clarification["question"],
+                        intent=intent
+                    )
                 return ParsedMessage(
                     intent=intent,
                     title=title,
@@ -190,6 +212,14 @@ class NLPPipeline:
         # Task deletion commands
         if any(keyword in text_lower for keyword in ["удали", "delete", "remove"]):
             return "delete_task"
+
+        # Help commands
+        if any(keyword in text_lower for keyword in ["помощь", "help", "что ты умеешь", "что умеешь", "команды", "функции", "возможности"]):
+            return "help"
+
+        # Notification/reminder commands
+        if any(keyword in text_lower for keyword in ["уведоми", "напомни", "remind", "notify", "напоминание", "уведомление"]):
+            return "schedule_notification"
 
         # Default to task creation
         return "create_task"
@@ -291,6 +321,25 @@ class NLPPipeline:
                     "question": "⏰ К какому сроку это нужно выполнить? Укажите дедлайн, чтобы я мог правильно спланировать и напомнить вовремя."
                 }
 
+        # Check for missing time when date is specified but time is midnight (00:00:00)
+        if datetime_obj and intent == "create_task":
+            # Check if time is midnight (00:00:00) and date is not today
+            almaty_tz = resolve_timezone("Asia/Almaty")
+            datetime_almaty = datetime_obj.astimezone(almaty_tz)
+            current_time_almaty = now_utc().astimezone(almaty_tz)
+            
+            # Check if time is midnight (00:00:00) or very close to it
+            time_is_midnight = datetime_almaty.hour == 0 and datetime_almaty.minute == 0 and datetime_almaty.second == 0
+            
+            # Check if date is not today (to avoid asking for time when user just says "today")
+            date_is_not_today = datetime_almaty.date() != current_time_almaty.date()
+            
+            if time_is_midnight and date_is_not_today:
+                return {
+                    "type": "time",
+                    "question": "⏰ Во сколько нужно выполнить задачу? Укажите точное время, например: 'в 15:00' или 'утром'."
+                }
+
         # Check for vague time references that need clarification
         if datetime_obj and intent == "create_task":
             current_time = now_utc().astimezone(resolve_timezone("Asia/Almaty"))
@@ -345,11 +394,36 @@ class NLPPipeline:
             hours = int(time_match.group(1))
             minutes = int(time_match.group(2))
 
-            # Handle 12-hour format and invalid hours
+            # Handle 12-hour format and invalid hours, with AM/PM detection
+            # Normalize hours > 23
             if hours > 23:
-                hours = hours % 12  # Assume PM for large numbers
-            if hours < 6:
-                hours += 12  # Assume PM for morning hours mentioned as afternoon
+                hours = hours % 12
+            # Detect AM/PM indicators in text
+            am_keywords = ['am', 'утра', 'утром', 'ночи', 'раннего']
+            pm_keywords = ['pm', 'вечера', 'дня', 'после полудня']
+            has_am = any(kw in text_lower for kw in am_keywords)
+            has_pm = any(kw in text_lower for kw in pm_keywords)
+            # Check for direct am/pm attached to time (e.g., "1:04pm")
+            ampm_match = re.search(r'(\d{1,2})[ :.](\d{2})\s*([ap]m)', text_lower)
+            if ampm_match:
+                if ampm_match.group(3) == 'pm':
+                    has_pm = True
+                else:
+                    has_am = True
+            # Adjust hours based on indicators
+            if has_pm and not has_am:
+                if hours < 12:
+                    hours += 12
+            elif has_am and not has_pm:
+                if hours == 12:
+                    hours = 0
+            elif 0 < hours < 6:
+                # No explicit indicator, use current time heuristic
+                current_hour = now.hour
+                # Assume PM only if currently daytime (6 AM - 10 PM)
+                if 6 <= current_hour < 22:
+                    hours += 12
+                # else keep as AM (early morning)
 
             # Determine date based on context
             if "завтра" in text_lower:
@@ -370,6 +444,31 @@ class NLPPipeline:
 
         # Fallback to relative date extraction
         return self._normalize_date(None, text, timezone)
+
+    def _clean_title(self, title: str) -> str:
+        """Remove time and date expressions from title to keep it clean."""
+        if not title:
+            return title
+        # Patterns to remove (time with optional AM/PM, date words)
+        patterns = [
+            r'(?:в|на|к)\s+\d{1,2}[ :.]\d{2}\s*(?:[ap]m|утра|вечера|дня|ночи)?',  # в 1:04, в 1:04 pm, в 13:04
+            r'\d{1,2}[ :.]\d{2}\s*[ap]m',  # 1:04pm
+            r'\b(?:завтра|послезавтра|сегодня)\b',
+            r'в\s+(?:пятницу|понедельник|вторник|среду|четверг|субботу|воскресенье)',
+            r'на\s+следующей\s+неделе',
+            r'через\s+неделю',
+            r'через\s+день',
+            r'через\s+два\s+дня',
+            r'через\s+три\s+дня',
+            r'в\s+утра',
+            r'в\s+вечера',
+        ]
+        cleaned = title
+        for pat in patterns:
+            cleaned = re.sub(pat, '', cleaned, flags=re.IGNORECASE)
+        # Collapse multiple spaces and strip punctuation
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip(' .,;:!?')
+        return cleaned if cleaned else "Задача"
 
     def _parse_datetime_safely(self, datetime_str: str, timezone: str) -> Union[DateTime, None]:
         """Safely parse datetime string with proper timezone handling."""
@@ -409,36 +508,54 @@ class NLPPipeline:
         now = now_utc().astimezone(resolve_timezone(timezone_name))
 
         if "завтра" in text_lower:
-            return (now + timedelta(days=1)).isoformat()
+            dt = now + timedelta(days=1)
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         elif "сегодня" in text_lower:
             return now.isoformat()
         elif "пятниц" in text_lower:
             days_ahead = 4 - now.weekday()
             if days_ahead <= 0:
                 days_ahead += 7
-            return (now + timedelta(days=days_ahead)).isoformat()
-        elif "на следующей неделе" in text_lower:
-            return (now + timedelta(weeks=1)).isoformat()
+            dt = now + timedelta(days=days_ahead)
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        elif "на следующей неделе" in text_lower or "через неделю" in text_lower:
+            dt = now + timedelta(weeks=1)
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         elif "на этой неделе" in text_lower or "на неделе" in text_lower:
             days_ahead = 6 - now.weekday()
-            return (now + timedelta(days=max(1, days_ahead))).isoformat()
+            dt = now + timedelta(days=max(1, days_ahead))
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         elif "до конца дня" in text_lower or "к концу дня" in text_lower:
             return now.isoformat()
         elif "до конца недели" in text_lower:
             days_ahead = 5 - now.weekday()
             if days_ahead <= 0:
                 days_ahead += 7
-            return (now + timedelta(days=days_ahead)).isoformat()
-        elif "месяц" in text_lower:
+            dt = now + timedelta(days=days_ahead)
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        elif "месяц" in text_lower or "через месяц" in text_lower:
             next_month = cast(DateTime, now + relativedelta(months=1))
-            return next_month.isoformat()
+            return next_month.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        elif "через день" in text_lower:
+            dt = now + timedelta(days=1)
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        elif "через два дня" in text_lower:
+            dt = now + timedelta(days=2)
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        elif "через три дня" in text_lower:
+            dt = now + timedelta(days=3)
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        elif "через неделю" in text_lower:
+            dt = now + timedelta(weeks=1)
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
         # Check for date numbers like "25 числа", "до 20-го"
         match = re.search(r"(\d{1,2})[-го]*\s*числа", text_lower)
         if match:
             day = int(match.group(1))
             try:
-                return now.replace(day=day).isoformat()
+                dt = now.replace(day=day)
+                return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
             except ValueError:
                 pass
 

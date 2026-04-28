@@ -160,7 +160,7 @@ class Reminder(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    task_id: Mapped[Union[uuid.UUID, None]] = mapped_column(Uuid(as_uuid=True), ForeignKey("tasks.id"), nullable=True)
+    task_id: Mapped[Union[uuid.UUID, None]] = mapped_column(Uuid(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True)
     remind_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     kind: Mapped[ReminderKind] = mapped_column(SqlEnum(ReminderKind), nullable=False)
     status: Mapped[ReminderStatus] = mapped_column(

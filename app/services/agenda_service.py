@@ -281,3 +281,215 @@ class AgendaService:
             recommendations.append(f"🔥 Дни с приоритетными задачами: {', '.join(priority_days)}")
 
         return recommendations
+
+    def get_day_summary(self, user_id: str, target_date: Union[DateTime, None] = None) -> Dict[str, Any]:
+        """Get daily summary - tasks only for today's date."""
+        if target_date is None:
+            target_date = now_utc()
+
+        db = SessionLocal()
+        try:
+            user = db.get(User, user_id)
+            if not user:
+                return {"error": "User not found"}
+
+            timezone = user.timezone
+            user_tz = resolve_timezone(timezone)
+
+            # Convert date to user's timezone for day boundaries
+            day_start_local = target_date.astimezone(user_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end_local = day_start_local + timedelta(days=1)
+
+            from app.core.time import to_utc
+            day_start_utc = to_utc(day_start_local, timezone)
+            day_end_utc = to_utc(day_end_local, timezone)
+
+            # Get tasks for today only (not including tasks without due date)
+            tasks_today = db.query(Task).filter(
+                and_(
+                    Task.user_id == user_id,
+                    Task.is_completed == False,
+                    Task.due_at >= day_start_utc,
+                    Task.due_at < day_end_utc
+                )
+            ).order_by(Task.priority.desc(), Task.due_at).all()
+
+            day_name = day_start_local.strftime("%A")
+
+            return {
+                "date": day_start_local.strftime("%Y-%m-%d"),
+                "day_of_week": day_name,
+                "tasks": [
+                    {
+                        "id": str(task.id),
+                        "title": task.title,
+                        "description": task.description,
+                        "priority": task.priority.value,
+                        "status": task.status.value,
+                        "due_at": task.due_at.astimezone(user_tz).isoformat() if task.due_at else None,
+                        "created_at": task.created_at.astimezone(user_tz).isoformat() if task.created_at else None
+                    }
+                    for task in tasks_today
+                ],
+                "total_tasks": len(tasks_today)
+            }
+        finally:
+            db.close()
+
+    def get_week_summary(self, user_id: str, pivot_date: Union[DateTime, None] = None) -> Dict[str, Any]:
+        """Get weekly summary - tasks for the next 7 days, grouped by day with date and day of week."""
+        if pivot_date is None:
+            pivot_date = now_utc()
+
+        db = SessionLocal()
+        try:
+            user = db.get(User, user_id)
+            if not user:
+                return {"error": "User not found"}
+
+            timezone = user.timezone
+            user_tz = resolve_timezone(timezone)
+
+            # Get week boundaries in local timezone (starting from pivot_date)
+            week_start_local = pivot_date.astimezone(user_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+            week_end_local = week_start_local + timedelta(days=7)
+
+            from app.core.time import to_utc
+            week_start_utc = to_utc(week_start_local, timezone)
+            week_end_utc = to_utc(week_end_local, timezone)
+
+            # Get all tasks for the week (excluding completed tasks)
+            tasks_week = db.query(Task).filter(
+                and_(
+                    Task.user_id == user_id,
+                    Task.is_completed == False,
+                    Task.due_at >= week_start_utc,
+                    Task.due_at < week_end_utc
+                )
+            ).order_by(Task.priority.desc(), Task.due_at).all()
+
+            # Group tasks by day
+            daily_tasks = {}
+            for i in range(7):
+                day_date_local = week_start_local + timedelta(days=i)
+                day_name = day_date_local.strftime("%A")
+                date_str = day_date_local.strftime("%Y-%m-%d")
+
+                day_start_utc = to_utc(day_date_local, timezone)
+                day_end_utc = to_utc(day_date_local + timedelta(days=1), timezone)
+
+                day_task_list = [
+                    {
+                        "id": str(task.id),
+                        "title": task.title,
+                        "description": task.description,
+                        "priority": task.priority.value,
+                        "status": task.status.value,
+                        "due_at": task.due_at.astimezone(user_tz).isoformat() if task.due_at else None
+                    }
+                    for task in tasks_week
+                    if day_start_utc <= task.due_at < day_end_utc
+                ]
+
+                daily_tasks[date_str] = {
+                    "date": date_str,
+                    "day_of_week": day_name,
+                    "tasks": day_task_list,
+                    "task_count": len(day_task_list)
+                }
+
+            total_tasks = len(tasks_week)
+
+            return {
+                "week_start": week_start_local.strftime("%Y-%m-%d"),
+                "week_end": (week_end_local - timedelta(days=1)).strftime("%Y-%m-%d"),
+                "total_tasks": total_tasks,
+                "days": daily_tasks
+            }
+        finally:
+            db.close()
+
+    def get_month_summary(self, user_id: str, pivot_date: Union[DateTime, None] = None) -> Dict[str, Any]:
+        """Get monthly summary - tasks grouped by 7-day weeks."""
+        if pivot_date is None:
+            pivot_date = now_utc()
+
+        db = SessionLocal()
+        try:
+            user = db.get(User, user_id)
+            if not user:
+                return {"error": "User not found"}
+
+            timezone = user.timezone
+            user_tz = resolve_timezone(timezone)
+
+            # Get month boundaries in local timezone
+            month_start_local = pivot_date.astimezone(user_tz).replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
+            # Calculate next month
+            if month_start_local.month == 12:
+                month_end_local = month_start_local.replace(year=month_start_local.year + 1, month=1)
+            else:
+                month_end_local = month_start_local.replace(month=month_start_local.month + 1)
+
+            from app.core.time import to_utc
+            month_start_utc = to_utc(month_start_local, timezone)
+            month_end_utc = to_utc(month_end_local, timezone)
+
+            # Get all tasks for the month (excluding completed tasks)
+            tasks_month = db.query(Task).filter(
+                and_(
+                    Task.user_id == user_id,
+                    Task.is_completed == False,
+                    Task.due_at >= month_start_utc,
+                    Task.due_at < month_end_utc
+                )
+            ).order_by(Task.priority.desc(), Task.due_at).all()
+
+            # Group tasks by 7-day weeks
+            weeks = {}
+            current_week_start = month_start_local
+            week_num = 1
+
+            while current_week_start < month_end_local:
+                week_end_local = current_week_start + timedelta(days=7)
+
+                week_start_utc = to_utc(current_week_start, timezone)
+                week_end_utc_calc = to_utc(week_end_local, timezone)
+
+                week_tasks = [
+                    {
+                        "id": str(task.id),
+                        "title": task.title,
+                        "description": task.description,
+                        "priority": task.priority.value,
+                        "status": task.status.value,
+                        "due_at": task.due_at.astimezone(user_tz).isoformat() if task.due_at else None,
+                        "due_date": task.due_at.astimezone(user_tz).strftime("%Y-%m-%d") if task.due_at else None
+                    }
+                    for task in tasks_month
+                    if week_start_utc <= task.due_at < week_end_utc_calc
+                ]
+
+                weeks[f"week_{week_num}"] = {
+                    "period": {
+                        "start": current_week_start.strftime("%Y-%m-%d"),
+                        "end": (week_end_local - timedelta(days=1)).strftime("%Y-%m-%d")
+                    },
+                    "tasks": week_tasks,
+                    "task_count": len(week_tasks)
+                }
+
+                current_week_start = week_end_local
+                week_num += 1
+
+            total_tasks = len(tasks_month)
+
+            return {
+                "month": month_start_local.strftime("%Y-%m"),
+                "total_tasks": total_tasks,
+                "weeks": weeks
+            }
+        finally:
+            db.close()
