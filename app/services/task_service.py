@@ -1,8 +1,9 @@
 import logging
 import uuid
 from typing import Union
+from datetime import datetime as DateTime
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.orm import Session
 
 from app.db.models import Task, TaskPriority, TaskStatus, User, ReminderKind, CalendarEvent
@@ -37,17 +38,17 @@ class TaskService:
         # Auto-create reminders for the task
         from app.services.reminder_service import ReminderService
         reminder_service = ReminderService(self.db)
-        reminder_service.auto_create_reminders_for_all_tasks(task)
-        
-        # Send first reminder about the created task
-        try:
-            # Use hello_world template for events, default for tasks
-            if parsed_intent == "create_event":
-                reminder_service.send_first_reminder(task, template="hello_world")
-            else:
-                reminder_service.send_first_reminder(task, template="default")
-        except Exception as e:
-            logger.warning(f"Failed to send first reminder for task {task.id}: {e}")
+        # If a custom reminder time is provided, use it; otherwise fallback to default behavior
+        if hasattr(payload, "reminder_time") and payload.reminder_time:
+            # Create a single reminder at the custom time
+            reminder_service.create_reminder(
+                user_id=payload.user_id,
+                task_id=task.id,
+                remind_at=payload.reminder_time,
+                kind=ReminderKind.EXACT,
+            )
+        else:
+            reminder_service.auto_create_reminders_for_all_tasks(task)
         
         return task
 
@@ -65,6 +66,28 @@ class TaskService:
             setattr(task, field, value)
         task.updated_at = now_utc()
 
+        self.db.commit()
+        self.db.refresh(task)
+        return task
+
+    def update_task_time_by_id(self, task_id: uuid.UUID, new_time: DateTime) -> Union[Task, None]:
+        """Update a task's due time by task ID. Preserves the date if task has one."""
+        task = self.db.get(Task, task_id)
+        if not task:
+            return None
+
+        # If task has existing due_at, preserve the date and update time
+        if task.due_at:
+            from datetime import datetime, timezone
+            existing_date = task.due_at.date()
+            new_datetime = DateTime.combine(existing_date, new_time.time()).replace(tzinfo=timezone.utc)
+        else:
+            # If no existing due_at, use today's date with the new time
+            from datetime import datetime, timezone, date
+            new_datetime = DateTime.combine(date.today(), new_time.time()).replace(tzinfo=timezone.utc)
+
+        task.due_at = new_datetime
+        task.updated_at = now_utc()
         self.db.commit()
         self.db.refresh(task)
         return task
@@ -469,3 +492,80 @@ class TaskService:
         except Exception as e:
             logger.error(f"Failed to send {digest_type} digest to user {user_id}: {e}")
             return False
+
+    def find_task_by_reference(self, user_id: uuid.UUID, task_ref: str) -> Union[Task, None]:
+        """Find a task by title or partial title match."""
+        from sqlalchemy import or_
+        
+        # Try exact match first
+        stmt = select(Task).where(
+            Task.user_id == user_id,
+            Task.status == TaskStatus.OPEN,
+            Task.title.ilike(task_ref)
+        )
+        task = self.db.scalars(stmt).first()
+        if task:
+            return task
+        
+        # Try partial match
+        stmt = select(Task).where(
+            Task.user_id == user_id,
+            Task.status == TaskStatus.OPEN,
+            Task.title.ilike(f"%{task_ref}%")
+        ).order_by(Task.created_at.desc())
+        return self.db.scalars(stmt).first()
+
+    def update_task_by_reference(
+        self, 
+        user_id: uuid.UUID, 
+        task_ref: str, 
+        due_at: Union[DateTime, None] = None,
+        priority: Union[TaskPriority, None] = None,
+        title: Union[str, None] = None,
+        description: Union[str, None] = None
+    ) -> Union[Task, None]:
+        """Update a task by title reference with new values."""
+        task = self.find_task_by_reference(user_id, task_ref)
+        if not task:
+            return None
+        
+        if due_at is not None:
+            task.due_at = due_at
+        if priority is not None:
+            task.priority = priority
+        if title is not None:
+            task.title = title
+        if description is not None:
+            task.description = description
+        
+        task.updated_at = now_utc()
+        self.db.commit()
+        self.db.refresh(task)
+        return task
+
+    def update_task_date(self, user_id: uuid.UUID, task_ref: str, new_date: DateTime) -> Union[Task, None]:
+        """Update a task's due date by title reference."""
+        return self.update_task_by_reference(user_id, task_ref, due_at=new_date)
+
+    def update_task_time(self, user_id: uuid.UUID, task_ref: str, new_time: DateTime) -> Union[Task, None]:
+        """Update a task's due time by title reference. Preserves the date if task has one."""
+        task = self.find_task_by_reference(user_id, task_ref)
+        if not task:
+            return None
+        
+        # If task has existing due_at, preserve the date and update time
+        if task.due_at:
+            from datetime import datetime, timezone
+            existing_date = task.due_at.date()
+            new_datetime = DateTime.combine(existing_date, new_time.time()).replace(tzinfo=timezone.utc)
+        else:
+            # If no existing due_at, use today's date with the new time
+            from datetime import datetime, timezone, date
+            new_datetime = DateTime.combine(date.today(), new_time.time()).replace(tzinfo=timezone.utc)
+        
+        return self.update_task_by_reference(user_id, task_ref, due_at=new_datetime)
+
+    def update_task_priority(self, user_id: uuid.UUID, task_ref: str, new_priority: str) -> Union[Task, None]:
+        """Update a task's priority by title reference."""
+        priority = self.map_priority(new_priority)
+        return self.update_task_by_reference(user_id, task_ref, priority=priority)

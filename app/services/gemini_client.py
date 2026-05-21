@@ -66,6 +66,8 @@ DATETIME EXTRACTION (only for create_task/create_event/schedule_notification):
 - Kazakh time formats: "15 00", "15:00", "3 часа дня"
 - Relative dates: завтра=tomorrow, послезавтра=day after tomorrow
 - Days: понедельник=Monday, вторник=Tuesday, etc.
+- Through patterns: "через неделю"=in a week, "через день"=in a day, "через два дня"=in two days
+- Next week: "на следующей неделе"=next week
 - Return datetime in ISO format: "2026-04-22T15:00:00"
 
 EXTRACTION RULES:
@@ -90,7 +92,7 @@ RESPONSE FORMAT:
 }}
 
 Message: "{text}"
-         """
+          """
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {

@@ -56,6 +56,9 @@ def inbound_whatsapp(webhook_payload: dict) -> dict[str, str]:
             text = msg["text"].get("body", "")
         elif "interactive" in msg:
             text = msg["interactive"].get("button_reply", {}).get("title", "")
+        elif "button" in msg:
+            # Handle button messages from quick reply buttons
+            text = msg["button"].get("text", "") or msg["button"].get("payload", "")
 
         if not text:
             logger.info("No text in message")

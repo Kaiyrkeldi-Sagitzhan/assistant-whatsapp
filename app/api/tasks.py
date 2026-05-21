@@ -1,5 +1,5 @@
 import uuid
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -59,6 +59,16 @@ def list_overdue_tasks(user_id: uuid.UUID, db: Session = Depends(get_db)) -> lis
 def update_task(task_id: uuid.UUID, payload: TaskUpdate, db: Session = Depends(get_db)) -> TaskResponse:
     service = TaskService(db)
     task = service.update_task(task_id, payload)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return TaskResponse.model_validate(task)
+
+
+@router.patch("/{task_id}/time", response_model=TaskResponse)
+def update_task_time(task_id: uuid.UUID, new_time: datetime, db: Session = Depends(get_db)) -> TaskResponse:
+    """Update only the time of a task, preserving the existing date."""
+    service = TaskService(db)
+    task = service.update_task_time_by_id(task_id, new_time)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return TaskResponse.model_validate(task)

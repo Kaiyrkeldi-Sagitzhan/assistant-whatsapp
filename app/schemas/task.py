@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Union
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 
 from app.db.models import TaskPriority, TaskStatus
 
@@ -13,14 +13,14 @@ class TaskCreate(BaseModel):
     description: Union[str, None] = None
     due_at: Union[datetime, None] = None
     priority: TaskPriority = TaskPriority.MEDIUM
-
+    reminder_time: Union[datetime, None] = None  # New field for custom reminder time
 
 class TaskUpdate(BaseModel):
     title: Union[str, None] = None
     description: Union[str, None] = None
     due_at: Union[datetime, None] = None
     priority: Union[TaskPriority, None] = None
-
+    reminder_time: Union[datetime, None] = None  # Add to update schema
 
 class TaskResponse(BaseModel):
     id: uuid.UUID
@@ -30,12 +30,9 @@ class TaskResponse(BaseModel):
     status: TaskStatus
     priority: TaskPriority
     due_at: Union[datetime, None]
-
-    model_config = ConfigDict(from_attributes=True)
-
+    reminder_time: Union[datetime, None] = None  # Add to response schema
 
 class CustomReminderCreate(BaseModel):
-    """Schema for creating a custom reminder (not tied to a task)."""
     user_id: uuid.UUID
     title: str
     remind_at: datetime
@@ -43,12 +40,9 @@ class CustomReminderCreate(BaseModel):
 
 
 class CustomReminderResponse(BaseModel):
-    """Schema for custom reminder response."""
     id: uuid.UUID
     user_id: uuid.UUID
     title: str
-    description: Union[str, None]
     remind_at: datetime
-    status: str
-
-    model_config = ConfigDict(from_attributes=True)
+    description: Union[str, None]
+    task_id: Union[uuid.UUID, None] = None

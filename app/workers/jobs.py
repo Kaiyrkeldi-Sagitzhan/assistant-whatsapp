@@ -34,17 +34,17 @@ USER_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 logger = logging.getLogger(__name__)
 
 
-def _get_or_create_user(db: Session, user_external_id: str) -> User:
+def _get_or_create_user(db: Session, user_external_id: str) -> tuple[User, bool]:
     user_id = uuid.uuid5(USER_NAMESPACE, user_external_id)
     user = db.get(User, user_id)
     if user:
-        return user
+        return user, False
 
     user = User(id=user_id)
     db.add(user)
     db.commit()
     db.refresh(user)
-    return user
+    return user, True
 
 
 def _store_inbound(
@@ -85,7 +85,16 @@ def process_whatsapp_inbound(
     db = SessionLocal()
     try:
         # Use phone number as user identifier
-        user = _get_or_create_user(db, phone)
+        user, is_new_user = _get_or_create_user(db, phone)
+        
+        # Send welcome template for new users
+        if is_new_user:
+            try:
+                client = WhatsAppMetaClient()
+                asyncio.run(client.send_welcome_template(phone))
+            except Exception as e:
+                logger.error("Failed to send welcome template: %s", e)
+        
         if not _store_inbound(
             db,
             channel=InboundChannel.WHATSAPP,
@@ -98,8 +107,13 @@ def process_whatsapp_inbound(
             return
         logger.info("Message stored successfully for user %s", user.id)
 
-        # Check for pending clarification
+        # Initialize context manager for message processing
         context_mgr = ConversationContext()
+        
+        # Store message context for potential multi-message tasks
+        asyncio.run(context_mgr.store_message_context(str(user.id), text, {"intent": None, "title": None}))
+
+        # Check for pending clarification
         pending_context = asyncio.run(context_mgr.consume_clarification(str(user.id), text))
         
         # Parse message to determine intent
@@ -156,33 +170,131 @@ def process_whatsapp_inbound(
             logger.info("NLP parsed message: intent='%s', title='%s', datetime='%s'", parsed.intent, parsed.title, parsed.datetime)
             print("Parsed intent:", parsed.intent, "for message:", text)
 
-            if parsed.intent == "daily_agenda":
-                # Generate daily agenda
-                agenda_service = AgendaService()
-                agenda = agenda_service.generate_daily_agenda(str(user.id))
+            if parsed.intent == "agenda_select":
+                # Send agenda selection template
+                try:
+                    client = WhatsAppMetaClient()
+                    asyncio.run(client.send_agenda_select_template(phone))
+                    return
+                except Exception as e:
+                    logger.error("Failed to send agenda select template: %s", e)
+                    # Fallback to text
+                    confirmation = "📋 Выберите период:\n• День - задачи на сегодня\n• Неделя - план на 7 дней"
 
-                if "error" in agenda:
-                    confirmation = (
-                        "😔 Не удалось сформировать повестку дня.\n"
-                        "🔄 Попробуйте позже или создайте задачи вручную.\n"
-                        "💡 Пример: 'Купить продукты завтра'"
-                    )
+            elif parsed.intent == "daily_agenda":
+                # Get tasks for today and send via template
+                service = TaskService(db)
+                tasks = service.list_open_tasks(user.id)
+                
+                # Filter tasks for today
+                from app.core.time import resolve_timezone, now_utc
+                local_tz = resolve_timezone(user.timezone)
+                today = now_utc().astimezone(local_tz).date()
+                
+                today_tasks = []
+                for task in tasks:
+                    if task.due_at:
+                        task_date = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz).date()
+                        if task_date == today:
+                            today_tasks.append(task)
+                
+                # Sort by priority (high to low) then by time
+                priority_order = {"high": 0, "medium": 1, "low": 2}
+                today_tasks.sort(key=lambda t: (
+                    priority_order.get(t.priority.value, 3),
+                    t.due_at or datetime.max.replace(tzinfo=timezone.utc)
+                ))
+                
+                # Format tasks list
+                if not today_tasks:
+                    tasks_list = "Нет задач на сегодня"
                 else:
-                    confirmation = _format_daily_agenda(agenda)
+                    task_lines = []
+                    for task in today_tasks:
+                        time_str = ""
+                        if task.due_at:
+                            local_time = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
+                            time_str = local_time.strftime("%H:%M")
+                        # Add priority indicator
+                        priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢", "critical": "⭐"}.get(task.priority.value, "⚪")
+                        task_lines.append(f"{priority_emoji} {task.title} ({time_str})" if time_str else f"{priority_emoji} {task.title}")
+                    tasks_list = "\n".join(task_lines)
+                
+                # Send template
+                try:
+                    client = WhatsAppMetaClient()
+                    asyncio.run(client.send_tasks_day_template(phone, tasks_list))
+                    return
+                except Exception as e:
+                    logger.error("Failed to send tasks day template: %s", e)
+                    # Fallback to text
+                    if not today_tasks:
+                        confirmation = "✅ Отлично! У вас нет задач на сегодня."
+                    else:
+                        confirmation = f"📋 Задачи на сегодня:\n{tasks_list}"
 
             elif parsed.intent == "weekly_plan":
-                # Generate weekly plan
-                agenda_service = AgendaService()
-                plan = agenda_service.generate_weekly_plan(str(user.id))
-
-                if "error" in plan:
-                    confirmation = (
-                        "😔 Не удалось сформировать план на неделю.\n"
-                        "🔄 Попробуйте позже или создайте задачи вручную.\n"
-                        "💡 Пример: 'Подготовить отчет к пятнице'"
-                    )
-                else:
-                    confirmation = _format_weekly_plan(plan)
+                # Get tasks for the next 7 days
+                service = TaskService(db)
+                tasks = service.list_open_tasks(user.id)
+                
+                from app.core.time import resolve_timezone, now_utc
+                local_tz = resolve_timezone(user.timezone)
+                today = now_utc().astimezone(local_tz).date()
+                
+                # Group tasks by day
+                from datetime import timedelta
+                days_tasks = {}
+                for i in range(7):
+                    day_date = today + timedelta(days=i)
+                    days_tasks[day_date] = []
+                
+                for task in tasks:
+                    if task.due_at:
+                        task_date = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz).date()
+                        if task_date in days_tasks:
+                            days_tasks[task_date].append(task)
+                
+                # Format tasks list for each day with priority
+                priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢", "critical": "⭐"}.get
+                day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+                
+                day_lines = []
+                for i in range(7):
+                    day_date = today + timedelta(days=i)
+                    day_name = day_names[day_date.weekday()]
+                    day_str = day_date.strftime("%d.%m")
+                    
+                    day_task_list = days_tasks[day_date]
+                    # Sort by priority
+                    priority_order = {"high": 0, "medium": 1, "low": 2, "critical": 0}
+                    day_task_list.sort(key=lambda t: (
+                        priority_order.get(t.priority.value, 3),
+                        t.due_at or datetime.max.replace(tzinfo=timezone.utc)
+                    ))
+                    
+                    if day_task_list:
+                        task_parts = []
+                        for task in day_task_list:
+                            time_str = ""
+                            if task.due_at:
+                                local_time = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
+                                time_str = local_time.strftime("%H:%M")
+                            task_parts.append(f"{priority_emoji(task.priority.value, '⚪')} {task.title} ({time_str})" if time_str else f"{priority_emoji(task.priority.value, '⚪')} {task.title}")
+                        day_lines.append(f"{day_name}({day_str}): {' | '.join(task_parts)}")
+                    else:
+                        day_lines.append(f"{day_name}({day_str}):")
+                
+                tasks_list = " ||| ".join(day_lines)
+                
+                # Send template
+                try:
+                    client = WhatsAppMetaClient()
+                    asyncio.run(client.send_tasks_week_template(phone, tasks_list))
+                    return
+                except Exception as e:
+                    logger.error("Failed to send tasks week template: %s", e)
+                    confirmation = _format_weekly_plan(agenda_service.generate_weekly_plan(str(user.id)))
 
             elif parsed.intent == "help":
                 # Show comprehensive help
@@ -263,7 +375,7 @@ def process_whatsapp_inbound(
                     )
 
             elif parsed.intent == "list_tasks":
-                # List all tasks with priorities
+                # Show all tasks directly
                 service = TaskService(db)
                 tasks = service.list_open_tasks(user.id)
 
@@ -335,12 +447,36 @@ def process_whatsapp_inbound(
                     confirmation = f"🤔 Не нашел задачу с названием '{task_name}'. Попробуйте:\n• Проверить орфографию\n• Сказать точнее: 'выполнил купить молоко'\n• Посмотреть список: 'мои задачи'"
 
             elif parsed.intent == "update_task":
-                # Update task (for now just change due date if mentioned)
-                confirmation = (
-                    f"📝 Функция обновления задач скоро будет готова!\n"
-                    f"🔄 Пока что создайте новую задачу с правильными данными.\n"
-                    f"💡 Пример: 'Перенести {parsed.title} на завтра 16:00'"
-                )
+                # Update task - change due date/time
+                if parsed.title and parsed.datetime:
+                    service = TaskService(db)
+                    # Extract just the task name (remove time specification like "на 13 30")
+                    task_name = parsed.title
+                    # Remove time patterns from task name
+                    import re
+                    task_name = re.sub(r'\s+на\s+\d{1,2}\s+\d{1,2}\s*$', '', task_name)
+                    task_name = re.sub(r'\s+на\s+завтра.*$', '', task_name)
+                    task_name = re.sub(r'\s+на\s+.*$', '', task_name)
+                    
+                    task = service.find_task_by_reference(user.id, task_name)
+                    if task:
+                        # Update the task's due date/time
+                        task.due_at = parsed.datetime
+                        # Use now_utc() from app.core.time
+                        from app.core.time import now_utc
+                        task.updated_at = now_utc()
+                        db.commit()
+                        db.refresh(task)
+                        
+                        # Format confirmation message
+                        from app.core.time import resolve_timezone
+                        local_tz = resolve_timezone(user.timezone)
+                        local_due = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
+                        confirmation = f"✅ Задача обновлена: {task.title} → {local_due.strftime('%d.%m %H:%M')}"
+                    else:
+                        confirmation = f"❌ Задача не найдена: {task_name}"
+                else:
+                    confirmation = "❌ Укажите название задачи и новое время/дату"
 
             elif parsed.intent == "delete_task":
                 # Delete task
@@ -351,24 +487,16 @@ def process_whatsapp_inbound(
                 )
 
             elif parsed.intent == "unknown":
-                # Handle messages that don't contain tasks
-                logger.info("Message intent: %s - no task detected, using chat mode", parsed.intent)
+                # Send welcome template for messages that don't contain tasks
+                logger.info("Message intent: %s - no task detected, sending welcome template", parsed.intent)
                 try:
-                    # Use Gemini to generate a conversational response
-                    gemini = GeminiClient()
-                    confirmation = asyncio.run(gemini.chat(text, user.timezone))
+                    client = WhatsAppMetaClient()
+                    asyncio.run(client.send_welcome_template(phone))
+                    return  # Exit early, template already sent
                 except Exception as e:
-                    logger.error("Chat generation failed: %s", e)
-                    # Fallback to generic help message
-                    confirmation = (
-                        "👋 Привет! Я ваш помощник по задачам.\n\n"
-                        "📝 Я умею:\n"
-                        "• Создавать задачи: 'Купить молоко завтра в 10 утра'\n"
-                        "• Планировать встречи: 'Встреча с клиентом в пятницу 15:00'\n"
-                        "• Показывать задачи: 'мои задачи' или 'повестка'\n"
-                        "• Отмечать выполнение: 'выполнил купить молоко'\n\n"
-                        "💡 Попробуйте написать задачу, и я её запомню!"
-                    )
+                    logger.error("Failed to send welcome template: %s", e)
+                    # Fallback to text message
+                    confirmation = "👋 Привет! Я ваш помощник по управлению задачами. Напишите 'помощь', чтобы узнать, что я умею."
 
             elif parsed.intent == "create_task":
                 # Check if clarification is needed
@@ -398,26 +526,35 @@ def process_whatsapp_inbound(
                     )
                     db.commit()
 
-                    # Auto-create reminders if needed
-                    reminder_service = ReminderService(db)
-                    reminder_service.auto_create_reminders(task)
-
-                    # Format due date in user's timezone
-                    due_time_display = "не указан"
+                    # Format due date for template
+                    due_date_display = "не указан"
                     if task.due_at:
-                        # Convert UTC to user's local timezone for display
                         from app.core.time import resolve_timezone
                         local_tz = resolve_timezone(user.timezone)
                         local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
-                        due_time_display = local_due_at.strftime('%d.%m %H:%M')
+                        due_date_display = local_due_at.strftime('%d.%m %H:%M')
 
-                    reminder_info = "🔄 Напомню за 30 минут" if task.due_at else "📝 Задача без дедлайна"
-                    confirmation = (
-                        f"✅ Отлично! Задача '{task.title}' создана.\n"
-                        f"📅 Срок: {due_time_display}\n"
-                        f"{reminder_info}\n"
-                        f"💪 Вы всегда можете попросить список задач, сказав 'мои задачи'"
-                    )
+                    # Send template
+                    try:
+                        client = WhatsAppMetaClient()
+                        asyncio.run(client.send_task_created_template(phone, task.title, due_date_display))
+                        return
+                    except Exception as e:
+                        logger.error("Failed to send task created template: %s", e)
+                        # Fallback to text
+                        due_time_display = "не указан"
+                        if task.due_at:
+                            from app.core.time import resolve_timezone
+                            local_tz = resolve_timezone(user.timezone)
+                            local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
+                            due_time_display = local_due_at.strftime('%d.%m %H:%M')
+                        reminder_info = "🔄 Напомню за 30 минут" if task.due_at else "📝 Задача без дедлайна"
+                        confirmation = (
+                            f"✅ Отлично! Задача '{task.title}' создана.\n"
+                            f"📅 Срок: {due_time_display}\n"
+                            f"{reminder_info}\n"
+                            f"💪 Вы всегда можете попросить список задач, сказав 'мои задачи'"
+                        )
 
             elif parsed.intent == "create_event":
                 # Check if clarification is needed
@@ -448,21 +585,34 @@ def process_whatsapp_inbound(
                     )
                     db.commit()
 
-                    # Format event time in user's timezone
-                    event_time_display = "не указано"
+                    # Format event time for template
+                    event_date_display = "не указано"
                     if task.due_at:
-                        # Convert UTC to user's local timezone for display
                         from app.core.time import resolve_timezone
                         local_tz = resolve_timezone(user.timezone)
                         local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
-                        event_time_display = local_due_at.strftime('%d.%m %H:%M')
+                        event_date_display = local_due_at.strftime('%d.%m %H:%M')
 
-                    confirmation = (
-                        f"✅ Отлично! Встреча '{parsed.title}' запланирована.\n"
-                        f"📅 Время: {event_time_display}\n"
-                        f"🔥 Высокий приоритет - не забудьте подготовиться!\n"
-                        f"📅 Хотите посмотреть повестку дня? Просто скажите 'повестка'"
-                    )
+                    # Send template
+                    try:
+                        client = WhatsAppMetaClient()
+                        asyncio.run(client.send_task_created_template(phone, f"Событие: {parsed.title}", event_date_display))
+                        return
+                    except Exception as e:
+                        logger.error("Failed to send event created template: %s", e)
+                        # Fallback to text
+                        event_time_display = "не указано"
+                        if task.due_at:
+                            from app.core.time import resolve_timezone
+                            local_tz = resolve_timezone(user.timezone)
+                            local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
+                            event_time_display = local_due_at.strftime('%d.%m %H:%M')
+                        confirmation = (
+                            f"✅ Отлично! Встреча '{parsed.title}' запланирована.\n"
+                            f"📅 Время: {event_time_display}\n"
+                            f"🔥 Высокий приоритет - не забудьте подготовиться!\n"
+                            f"📅 Хотите посмотреть повестку дня? Просто скажите 'повестка'"
+                        )
 
             else:
                 logger.info("Message intent: %s - using chat mode", parsed.intent)
@@ -472,16 +622,20 @@ def process_whatsapp_inbound(
                     confirmation = asyncio.run(gemini.chat(text, user.timezone))
                 except Exception as e:
                     logger.error("Chat generation failed: %s", e)
-                    # Fallback to generic help message
-                    confirmation = (
-                        "👋 Привет! Я ваш помощник по задачам.\n\n"
-                        "📝 Я умею:\n"
-                        "• Создавать задачи: 'Купить молоко завтра в 10 утра'\n"
-                        "• Планировать встречи: 'Встреча с клиентом в пятницу 15:00'\n"
-                        "• Показывать задачи: 'мои задачи' или 'повестка'\n"
-                        "• Отмечать выполнение: 'выполнил купить молоко'\n\n"
-                        "🤔 Что бы вы хотели сделать?"
-                    )
+                    # Fallback to welcome template
+                    try:
+                        client = WhatsAppMetaClient()
+                        asyncio.run(client.send_welcome_template(phone))
+                        return  # Exit early, template already sent
+                    except Exception as template_error:
+                        logger.error("Failed to send welcome template: %s", template_error)
+                        # Try one more time
+                        try:
+                            client = WhatsAppMetaClient()
+                            asyncio.run(client.send_welcome_template(phone))
+                            return
+                        except Exception:
+                            pass  # Give up, no more fallbacks
 
         except Exception as e:
             logger.error("Error processing message: %s", str(e))

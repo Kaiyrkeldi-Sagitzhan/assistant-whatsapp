@@ -45,10 +45,11 @@ class ReminderKind(str, Enum):
 
 
 class ReminderStatus(str, Enum):
-    SCHEDULED = "scheduled"
-    SENT = "sent"
-    FAILED = "failed"
-    CANCELED = "canceled"
+    SCHEDULED = "SCHEDULED"
+    SENDING = "SENDING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+    CANCELED = "CANCELED"
 
 
 class InboundChannel(str, Enum):

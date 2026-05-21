@@ -2,7 +2,7 @@ import logging
 from dataclasses import dataclass
 import re
 from datetime import datetime as DateTime, timedelta
-from typing import Any, cast, Union
+from typing import Any, cast, Union, Dict
 
 from dateutil import parser as date_parser  # type: ignore[import-untyped]
 from dateutil.relativedelta import relativedelta  # type: ignore[import-untyped]
@@ -25,6 +25,7 @@ class ParsedMessage:
     needs_clarification: bool = False
     clarification_type: str = ""  # "time", "date", "title", "details"
     clarification_question: str = ""
+    priority: Union[str, None] = None  # For update_priority intent
 
 
 class NLPPipeline:
@@ -35,7 +36,7 @@ class NLPPipeline:
         # First check for rule-based intents (commands)
         intent = self._detect_intent(text)
 
-        if intent in ["agenda", "daily_agenda", "weekly_plan", "list_tasks"]:
+        if intent in ["agenda", "agenda_select", "daily_agenda", "weekly_plan", "list_tasks", "help"]:
             # These are command intents, don't need Gemini parsing
             return ParsedMessage(
                 intent=intent,
@@ -44,15 +45,29 @@ class NLPPipeline:
                 description=text,
                 confidence=1.0,
             )
-        elif intent in ["complete_task", "update_task", "delete_task"]:
-            # Task management commands - parse task reference
+        elif intent in ["complete_task", "update_task", "delete_task", "update_date", "update_time", "update_priority"]:
+            # Task management commands - parse task reference and optional datetime
             task_ref = self._extract_task_reference(text)
+            
+            # For update_date, update_time, update_priority - try to extract datetime or priority
+            datetime_obj = None
+            priority = None
+            
+            if intent in ["update_date", "update_time", "update_task"]:
+                # Try to extract datetime from the text
+                datetime_obj = self._extract_datetime_from_text(text, timezone)
+            elif intent == "update_priority":
+                # Try to extract priority from the text
+                priority = self._extract_priority_from_text(text)
+            
             return ParsedMessage(
                 intent=intent,
                 title=task_ref,
-                datetime=None,
+                datetime=datetime_obj,
                 description=text,
+                due_at=datetime_obj,
                 confidence=0.8,
+                priority=priority,
             )
         elif intent == "schedule_notification":
             # Custom notification scheduling
@@ -190,22 +205,37 @@ class NLPPipeline:
         """Detect intent from text using rule-based patterns."""
         text_lower = text.lower().strip()
 
-        # Agenda and planning commands
-        if any(keyword in text_lower for keyword in ["повестка", "agenda", "план", "что сегодня", "что у меня", "собери день"]):
-            if any(word in text_lower for word in ["недел", "week", "на неделю"]):
-                return "weekly_plan"
-            else:
-                return "daily_agenda"
+        # Agenda select button responses (quick replies from template)
+        if text_lower in ["день", "сегодня"]:
+            return "daily_agenda"
+        if text_lower in ["неделя", "неделю", "на неделю"]:
+            return "weekly_plan"
+        if text_lower in ["месяц", "на месяц"]:
+            return "weekly_plan"  # Use weekly_plan as fallback for month view
 
-        # Task list commands
+        # Agenda select command - show template for day/week selection
+        if text_lower in ["повестка", "agenda"]:
+            return "agenda_select"
+        if text_lower in ["план", "собери день"]:
+            return "agenda_select"
+        if any(keyword in text_lower for keyword in ["что сегодня", "что у меня"]):
+            return "daily_agenda"
+
+        # Task list commands - show all tasks directly
         if any(keyword in text_lower for keyword in ["список задач", "мои задачи", "задачи", "list tasks", "tasks", "что есть"]):
             return "list_tasks"
 
         # Task completion commands
-        if any(keyword in text_lower for keyword in ["выполнил", "готово", "сделал", "завершил", "complete", "done", "отметил"]):
+        if any(keyword in text_lower for keyword in ["выполнил", "готово", "сделал", "завершил", "закончил", "отметил", "выполнилa", "выполнилa", "выполнилa", "выполнилa", "complete", "done", "finished", "completed"]):
             return "complete_task"
 
-        # Task update commands
+        # Task update commands - more specific detection
+        if any(keyword in text_lower for keyword in ["обнови дату", "поменяй дату", "сменить дату", "change date", "update date"]):
+            return "update_date"
+        if any(keyword in text_lower for keyword in ["обнови время", "поменяй время", "сменить время", "change time", "update time"]):
+            return "update_time"
+        if any(keyword in text_lower for keyword in ["обнови приоритет", "поменяй приоритет", "сменить приоритет", "change priority", "update priority"]):
+            return "update_priority"
         if any(keyword in text_lower for keyword in ["измени", "перенеси", "обнови", "change", "update", "move"]):
             return "update_task"
 
@@ -226,18 +256,61 @@ class NLPPipeline:
 
     def _extract_task_reference(self, text: str) -> str:
         """Extract task reference from management commands."""
-        # Try to find task name after keywords
-        patterns = [
-            r"(?:выполнил|отметил|завершил|измени|перенеси|удали)\s+(.+)",
-            r"(?:complete|done|change|update|delete|remove)\s+(.+)",
+        # Define command keywords
+        command_keywords = [
+            "выполнил", "готово", "сделал", "завершил", "закончил", "отметил",
+            "выполнилa", "выполнилa", "выполнилa", "выполнилa", "complete", "done", "finished", "completed",
+            "перенеси", "измени", "поменяй", "смени", "обнови",
+            "change", "update", "delete", "remove"
         ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-
+        
+        text_lower = text.lower()
+        
+        # Find which command keyword is in the text
+        found_keyword = None
+        for keyword in command_keywords:
+            if keyword in text_lower:
+                found_keyword = keyword
+                break
+        
+        if found_keyword:
+            # Extract everything after the keyword
+            idx = text_lower.find(found_keyword)
+            task_ref = text[idx + len(found_keyword):].strip()
+            
+            # Remove time specifications like "на 13 30", "на завтра", etc.
+            import re
+            task_ref = re.sub(r'\s+на\s+\d{1,2}\s+\d{1,2}.*$', '', task_ref)
+            task_ref = re.sub(r'\s+на\s+завтра.*$', '', task_ref)
+            task_ref = re.sub(r'\s+на\s+.*$', '', task_ref)
+            
+            return task_ref.strip()
+        
         return text.strip()[:100]  # Fallback to first 100 chars
+
+    def _extract_priority_from_text(self, text: str) -> Union[str, None]:
+        """Extract priority from text using rule-based patterns."""
+        text_lower = text.lower()
+        
+        # Priority keywords in Russian
+        priority_map = {
+            "критический": "critical",
+            "критично": "critical",
+            "важный": "high",
+            "важно": "high",
+            "срочно": "high",
+            "высокий": "high",
+            "средний": "medium",
+            "обычный": "medium",
+            "низкий": "low",
+            "не важно": "low",
+        }
+        
+        for keyword, priority in priority_map.items():
+            if keyword in text_lower:
+                return priority
+        
+        return None
 
     def _check_needs_clarification(self, title: str, datetime_obj: Union[DateTime, None],
                                  original_text: str, intent: str) -> Union[dict, None]:
@@ -356,6 +429,41 @@ class NLPPipeline:
 
         return None
 
+    def process_clarification_response(
+        self,
+        clarification_type: str,
+        clarification_response: str,
+        original_text: str,
+        parsed_title: str,
+        parsed_description: str,
+        partial_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Process a clarification response and return complete task data."""
+        result = {
+            "title": parsed_title,
+            "description": parsed_description,
+            "datetime": None,
+            "partial_data": partial_data
+        }
+        
+        if clarification_type == "time":
+            # Try to extract datetime from the clarification response
+            rule_datetime = self._extract_datetime_from_text(clarification_response, "Asia/Almaty")
+            if rule_datetime:
+                result["datetime"] = rule_datetime
+        
+        elif clarification_type == "title":
+            # Use the clarification response as the title
+            result["title"] = self._clean_title(clarification_response.strip()[:50])
+        
+        elif clarification_type == "deadline":
+            # Try to extract datetime from the clarification response
+            rule_datetime = self._extract_datetime_from_text(clarification_response, "Asia/Almaty")
+            if rule_datetime:
+                result["datetime"] = rule_datetime
+        
+        return result
+
     def _looks_like_task(self, text: str) -> bool:
         """Check if text looks like it could be a task."""
         # Keywords that suggest this is a task
@@ -387,6 +495,46 @@ class NLPPipeline:
         """Extract datetime from text using rule-based patterns for Kazakh locale."""
         text_lower = text.lower()
         now = now_utc().astimezone(resolve_timezone(timezone))
+
+        # First, check for "через X" patterns (through/in X time)
+        through_match = re.search(r'через\s+(\d+)\s*(день|дня|дней|неделю|недели|недель|час|часа|часов|минуту|минуты|минут)', text_lower)
+        if through_match:
+            amount = int(through_match.group(1))
+            unit = through_match.group(2)
+            if unit in ['день', 'дня', 'дней']:
+                return to_utc(now + timedelta(days=amount), timezone)
+            elif unit in ['неделю', 'недели', 'недель']:
+                return to_utc(now + timedelta(weeks=amount), timezone)
+            elif unit in ['час', 'часа', 'часов']:
+                return to_utc(now + timedelta(hours=amount), timezone)
+            elif unit in ['минуту', 'минуты', 'минут']:
+                return to_utc(now + timedelta(minutes=amount), timezone)
+
+        # Check for "через неделю", "через день", "через два дня", etc.
+        if re.search(r'через\s+неделю', text_lower):
+            return to_utc(now + timedelta(weeks=1), timezone)
+        if re.search(r'через\s+день', text_lower):
+            return to_utc(now + timedelta(days=1), timezone)
+        if re.search(r'через\s+два\s+дня', text_lower):
+            return to_utc(now + timedelta(days=2), timezone)
+        if re.search(r'через\s+три\s+дня', text_lower):
+            return to_utc(now + timedelta(days=3), timezone)
+
+        # Check for "на следующей неделе" (next week)
+        if re.search(r'на\s+следующей\s+неделе', text_lower):
+            return to_utc(now + timedelta(weeks=1), timezone)
+
+        # Check for specific day names (понедельник, вторник, etc.)
+        day_map = {
+            'понедельник': 0, 'вторник': 1, 'среда': 2, 'четверг': 3,
+            'пятница': 4, 'суббота': 5, 'воскресенье': 6
+        }
+        for day_name, day_num in day_map.items():
+            if re.search(rf'в\s+{day_name}', text_lower) or re.search(rf'на\s+{day_name}', text_lower):
+                days_ahead = day_num - now.weekday()
+                if days_ahead <= 0:  # Target day already happened this week
+                    days_ahead += 7
+                return to_utc(now + timedelta(days=days_ahead), timezone)
 
         # Extract time patterns like "15 00", "15:00", "3 часа", "15.00"
         time_match = re.search(r'(\d{1,2})[ :.](\d{2})', text)
@@ -548,6 +696,21 @@ class NLPPipeline:
         elif "через неделю" in text_lower:
             dt = now + timedelta(weeks=1)
             return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        elif "через час" in text_lower:
+            dt = now + timedelta(hours=1)
+            return dt.replace(second=0, microsecond=0).isoformat()
+        elif "через" in text_lower:
+            # Check for "через X минут" or "через X часов"
+            minutes_match = re.search(r"через\s+(\d+)\s*минут", text_lower)
+            if minutes_match:
+                minutes = int(minutes_match.group(1))
+                dt = now + timedelta(minutes=minutes)
+                return dt.replace(second=0, microsecond=0).isoformat()
+            hours_match = re.search(r"через\s+(\d+)\s*час[а-я]*", text_lower)
+            if hours_match:
+                hours = int(hours_match.group(1))
+                dt = now + timedelta(hours=hours)
+                return dt.replace(second=0, microsecond=0).isoformat()
 
         # Check for date numbers like "25 числа", "до 20-го"
         match = re.search(r"(\d{1,2})[-го]*\s*числа", text_lower)

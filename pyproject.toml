@@ -9,17 +9,18 @@ description = "AI assistant for tasks from WhatsApp, email, and calendar"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.115.0",
-  "uvicorn[standard]>=0.30.0",
-  "sqlalchemy>=2.0.30",
-  "alembic>=1.13.2",
-  "psycopg[binary]>=3.2.0",
-  "pydantic-settings>=2.3.4",
-  "python-dateutil>=2.9.0.post0",
-  "httpx>=0.27.0",
-  "celery>=5.4.0",
-  "redis>=5.0.7",
-]
+   "fastapi>=0.115.0",
+   "uvicorn[standard]>=0.30.0",
+   "sqlalchemy>=2.0.30",
+   "alembic>=1.13.2",
+   "psycopg[binary]>=3.2.0",
+   "pydantic>=2.0.0",
+   "pydantic-settings>=2.3.4",
+   "python-dateutil>=2.9.0.post0",
+   "httpx>=0.27.0",
+   "celery>=5.4.0",
+   "redis>=5.0.7",
+   ]
 
 [project.optional-dependencies]
 dev = [

@@ -210,13 +210,19 @@ class ReminderService:
                 total_hours = int(delta.total_seconds() // 3600)
                 total_days = total_hours // 24
                 priority_emoji = {"critical": "🔥", "high": "⚡", "medium": "📌", "low": "📋"}.get(task.priority.value, "📋")
+                # Format the due time
+                from app.core.time import resolve_timezone
+                local_tz = resolve_timezone("Asia/Almaty")
+                due_time_local = task.due_at.astimezone(local_tz)
+                due_time_str = due_time_local.strftime("%H:%M")
+                
                 if total_days >= 1:
-                    return f"📌 {task.title} {priority_emoji} (через {total_days} дн.)"
+                    return f"📌 Через {total_days} дн: {task.title} {priority_emoji} в {due_time_str}"
                 elif total_hours >= 1:
-                    return f"📌 {task.title} {priority_emoji} (через {total_hours} ч)"
+                    return f"📌 Через {total_hours} ч: {task.title} {priority_emoji} в {due_time_str}"
                 else:
                     total_minutes = int(delta.total_seconds() // 60)
-                    return f"📌 {task.title} {priority_emoji} (через {total_minutes} мин)"
+                    return f"📌 Через {total_minutes} мин: {task.title} {priority_emoji} в {due_time_str}"
             if task:
                 priority_emoji = {"critical": "🔥", "high": "⚡", "medium": "📌", "low": "📋"}.get(task.priority.value, "📋")
                 return f"📌 {task.title} {priority_emoji}"
@@ -352,17 +358,16 @@ class ReminderService:
         
         return "📬 Напоминание"
 
-    def send_first_reminder(self, task: Task, template: str = "default") -> None:
+    async def send_first_reminder(self, task: Task, template: str = "default") -> None:
         """Send immediate first reminder about a newly created task.
         
         Args:
             task: The task to send reminder about
-            template: Template to use - "default" or "hello_world"
+            template: Template to use - "default", "hello_world", or "reminder_notification"
         """
         from app.db.models import InboundMessage, InboundChannel
         from app.integrations.whatsapp_meta import WhatsAppMetaClient
         from app.core.config import get_settings
-        import asyncio
         
         # Get user's WhatsApp phone
         stmt = (
@@ -390,39 +395,85 @@ class ReminderService:
             logger.warning(f"No WhatsApp phone found for user {task.user_id}, skipping first reminder")
             return
         
-        # Format first reminder text based on template
-        if template == "hello_world":
-            # Hello world template for event reminders
-            due_info = ""
-            if task.due_at:
-                from app.core.time import resolve_timezone
-                local_tz = resolve_timezone(task.user.timezone if hasattr(task, 'user') and task.user else "Asia/Almaty")
-                local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
-                due_info = f"\n📅 Время события: {local_due_at.strftime('%d.%m %H:%M')}"
-            
-            text = f"""👋 Привет! Это напоминание о вашем событии.
-
-📌 {task.title}{due_info}
-
-ℹ️ Описание: {task.description if task.description else 'Нет описания'}
-🎯 Приоритет: {task.priority.value}
-
-💡 Не забудьте подготовиться к событию!"""
-        else:
-            # Default template
-            due_info = ""
-            if task.due_at:
-                from app.core.time import resolve_timezone
-                local_tz = resolve_timezone(task.user.timezone if hasattr(task, 'user') and task.user else "Asia/Almaty")
-                local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
-                due_info = f"\n📅 Срок: {local_due_at.strftime('%d.%m %H:%M')}"
-            
-            priority_emoji = {"critical": "🔥", "high": "⚡", "medium": "📌", "low": "📋"}.get(task.priority.value, "📋")
-            text = f"✅ Задача создана{priority_emoji}\n\n📝 {task.title}{due_info}\n\n💪 Выполнить: 'выполнил {task.title}'"
+        # Format reminder data for template
+        due_info = ""
+        if task.due_at:
+            from app.core.time import resolve_timezone
+            local_tz = resolve_timezone(task.user.timezone if hasattr(task, 'user') and task.user else "Asia/Almaty")
+            local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
+            due_info = local_due_at.strftime('%H:%M')
+        
+        priority_emoji = {"critical": "🔥", "high": "⚡", "medium": "📌", "low": "📋"}.get(task.priority.value, "📋")
         
         try:
             client = WhatsAppMetaClient()
-            asyncio.run(client.send_text(phone, text))
+            
+            if template == "reminder_notification":
+                # Use template with variables
+                components = [
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {"type": "text", "text": task.title},
+                            {"type": "text", "text": due_info if due_info else "не указан"},
+                            {"type": "text", "text": "30 минут"},
+                        ]
+                    }
+                ]
+                await client.send_template(
+                    to=phone,
+                    template_name="reminder_notification",
+                    language_code="ru",
+                    components=components,
+                )
+            elif template == "hello_world":
+                # Hello world template for event reminders
+                due_time_str = ""
+                if task.due_at:
+                    from app.core.time import resolve_timezone
+                    local_tz = resolve_timezone(task.user.timezone if hasattr(task, 'user') and task.user else "Asia/Almaty")
+                    local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
+                    due_time_str = local_due_at.strftime('%d.%m %H:%M')
+                
+                components = [
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {"type": "text", "text": task.title},
+                            {"type": "text", "text": due_time_str},
+                            {"type": "text", "text": task.description if task.description else "Нет описания"},
+                        ]
+                    }
+                ]
+                await client.send_template(
+                    to=phone,
+                    template_name="hello_world",
+                    language_code="ru",
+                    components=components,
+                )
+            else:
+                # Default: send task created template
+                from app.core.time import resolve_timezone
+                local_tz = resolve_timezone(task.user.timezone if hasattr(task, 'user') and task.user else "Asia/Almaty")
+                local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz) if task.due_at else None
+                due_date_str = local_due_at.strftime('%d.%m %H:%M') if local_due_at else "не указан"
+                
+                components = [
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {"type": "text", "text": task.title},
+                            {"type": "text", "text": due_date_str},
+                        ]
+                    }
+                ]
+                await client.send_template(
+                    to=phone,
+                    template_name="task_bot_task_created",
+                    language_code="ru",
+                    components=components,
+                )
+            
             logger.info(f"First reminder sent for task {task.id} to user {task.user_id} (template: {template})")
         except Exception as e:
             logger.error(f"Failed to send first reminder for task {task.id}: {e}")
@@ -678,4 +729,82 @@ class ReminderService:
             pass
         
         return None
+
+    def send_due_reminders_now(self) -> int:
+        """
+        Manually send all due reminders.
+        
+        This is useful for testing or when you want to trigger reminder sending
+        outside of the Celery beat schedule.
+        
+        Returns:
+            Number of reminders sent
+        """
+        due_reminders = self.get_due_reminders()
+        sent_count = 0
+        
+        for reminder in due_reminders:
+            try:
+                task = self.db.get(Task, reminder.task_id) if reminder.task_id else None
+                text = self.format_reminder_text(reminder, task)
+                
+                # Get user's phone
+                stmt = (
+                    select(InboundMessage)
+                    .where(
+                        InboundMessage.user_id == reminder.user_id,
+                        InboundMessage.channel == InboundChannel.WHATSAPP,
+                    )
+                    .order_by(InboundMessage.received_at.desc())
+                    .limit(1)
+                )
+                inbound = self.db.scalars(stmt).first()
+                
+                phone = None
+                if inbound:
+                    payload = inbound.parse_result or {}
+                    if isinstance(payload, dict):
+                        phone = payload.get("phone")
+                
+                if phone:
+                    client = WhatsAppMetaClient()
+                    import asyncio
+                    
+                    # Check if this is a BEFORE_DEADLINE reminder and use template
+                    if reminder.kind.value == "before_deadline" and task:
+                        from app.core.time import resolve_timezone
+                        
+                        # Format due time
+                        due_info = ""
+                        if task.due_at:
+                            local_tz = resolve_timezone(task.user.timezone if hasattr(task, 'user') and task.user else "Asia/Almaty")
+                            local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
+                            due_info = local_due_at.strftime('%H:%M')
+                        
+                        components = [
+                            {
+                                "type": "body",
+                                "parameters": [
+                                    {"type": "text", "text": task.title},
+                                    {"type": "text", "text": due_info if due_info else "не указан"},
+                                    {"type": "text", "text": "30 минут"},
+                                ]
+                            }
+                        ]
+                        asyncio.run(client.send_template(
+                            to=phone,
+                            template_name="reminder_notification",
+                            language_code="ru",
+                            components=components,
+                        ))
+                    else:
+                        asyncio.run(client.send_text(phone, text))
+                    sent_count += 1
+                
+                self.update_reminder_status(reminder.id, ReminderStatus.SENT)
+            except Exception as e:
+                logger.error(f"Failed to send reminder {reminder.id}: {e}")
+                self.update_reminder_status(reminder.id, ReminderStatus.FAILED)
+        
+        return sent_count
 

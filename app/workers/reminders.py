@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import uuid
+from datetime import timezone
 from typing import Any, Union
 
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
-from app.db.models import InboundChannel, InboundMessage, ReminderStatus, Task, TaskStatus
+from app.db.models import InboundChannel, InboundMessage, ReminderKind, ReminderStatus, Task, TaskStatus
 from app.core.config import get_settings
 from app.core.time import now_utc
 from app.integrations.whatsapp_meta import WhatsAppMetaClient
@@ -27,14 +28,23 @@ def send_due_reminders() -> None:
 
         for reminder in due_reminders:
             try:
+                # Mark as SENDING first to prevent race conditions
+                reminder_service.update_reminder_status(reminder.id, ReminderStatus.SENDING)
+                
                 task = db.get(Task, reminder.task_id) if reminder.task_id else None
                 text = reminder_service.format_reminder_text(reminder, task)
 
-                _send_reminder_to_user(db, reminder.user_id, text)
+                _send_reminder_to_user(db, reminder.user_id, text, reminder=reminder, task=task)
 
                 reminder_service.update_reminder_status(reminder.id, ReminderStatus.SENT)
-            except Exception:
-                reminder_service.update_reminder_status(reminder.id, ReminderStatus.FAILED)
+            except Exception as e:
+                # Rollback the session to clear any failed transaction state
+                db.rollback()
+                # Try to update status to FAILED with a fresh session state
+                try:
+                    reminder_service.update_reminder_status(reminder.id, ReminderStatus.FAILED)
+                except Exception as inner_e:
+                    logger.error("Failed to update reminder %s to FAILED status: %s", reminder.id, inner_e)
     finally:
         db.close()
 
@@ -129,7 +139,7 @@ def send_overdue_reminders() -> None:
                             )
                             
                             text = reminder_service.format_reminder_text(reminder, task)
-                            _send_reminder_to_user(db, user.id, text)
+                            _send_reminder_to_user(db, user.id, text, reminder=reminder, task=task)
                             
                             reminder_service.update_reminder_status(reminder.id, ReminderStatus.SENT)
                             logger.info("Overdue reminder sent for task %s to user %s", task.id, user.id)
@@ -141,15 +151,48 @@ def send_overdue_reminders() -> None:
         db.close()
 
 
-def _send_reminder_to_user(db: Session, user_id: uuid.UUID, text: str) -> None:
-    """Send reminder text to user via WhatsApp."""
+def _send_reminder_to_user(db: Session, user_id: uuid.UUID, text: str, reminder=None, task=None) -> None:
+    """Send reminder text to user via WhatsApp.
+    
+    For BEFORE_DEADLINE reminders, uses the reminder_notification template with variables.
+    For other reminders, sends as plain text.
+    """
     settings = get_settings()
     phone = _get_latest_whatsapp_phone(db, user_id) or settings.whatsapp_test_recipient
     if not phone:
         raise ValueError(f"No WhatsApp phone found for user {user_id}")
 
     client = WhatsAppMetaClient()
-    asyncio.run(client.send_text(phone, text))
+    
+    # Check if this is a BEFORE_DEADLINE reminder and use template
+    if reminder and reminder.kind.value == "before_deadline" and task:
+        from app.core.time import resolve_timezone
+        
+        # Format due time
+        due_info = ""
+        if task.due_at:
+            local_tz = resolve_timezone(task.user.timezone if hasattr(task, 'user') and task.user else "Asia/Almaty")
+            local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
+            due_info = local_due_at.strftime('%H:%M')
+        
+        components = [
+            {
+                "type": "body",
+                "parameters": [
+                    {"type": "text", "text": task.title},
+                    {"type": "text", "text": due_info if due_info else "не указан"},
+                    {"type": "text", "text": "30 минут"},
+                ]
+            }
+        ]
+        asyncio.run(client.send_template(
+            to=phone,
+            template_name="reminder_notification",
+            language_code="ru",
+            components=components,
+        ))
+    else:
+        asyncio.run(client.send_text(phone, text))
 
 
 def _get_latest_whatsapp_phone(db: Session, user_id: uuid.UUID) -> Union[str, None]:
