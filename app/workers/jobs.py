@@ -18,6 +18,7 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal
 from app.core.config import get_settings
+from app.core.time import now_utc
 from app.integrations.calendar_google import GoogleCalendarSync
 from app.integrations.email_inbound import EmailInboundParser
 from app.integrations.whatsapp_meta import WhatsAppMetaClient
@@ -32,6 +33,21 @@ from app.workers.celery_app import celery_app
 USER_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
 logger = logging.getLogger(__name__)
+
+
+def run_async(coro):
+    """Run async coroutine safely, handling event loop issues in Celery workers."""
+    try:
+        # Try to get the current event loop
+        loop = asyncio.get_running_loop()
+        # If we're already in an async context, we need to use asyncio.run() in a thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result()
+    except RuntimeError:
+        # No running loop, we can use asyncio.run() directly
+        return asyncio.run(coro)
 
 
 def _get_or_create_user(db: Session, user_external_id: str) -> tuple[User, bool]:
@@ -91,7 +107,7 @@ def process_whatsapp_inbound(
         if is_new_user:
             try:
                 client = WhatsAppMetaClient()
-                asyncio.run(client.send_welcome_template(phone))
+                run_async(client.send_welcome_template(phone))
             except Exception as e:
                 logger.error("Failed to send welcome template: %s", e)
         
@@ -111,10 +127,10 @@ def process_whatsapp_inbound(
         context_mgr = ConversationContext()
         
         # Store message context for potential multi-message tasks
-        asyncio.run(context_mgr.store_message_context(str(user.id), text, {"intent": None, "title": None}))
+        run_async(context_mgr.store_message_context(str(user.id), text, {"intent": None, "title": None}))
 
         # Check for pending clarification
-        pending_context = asyncio.run(context_mgr.consume_clarification(str(user.id), text))
+        pending_context = run_async(context_mgr.consume_clarification(str(user.id), text))
         
         # Parse message to determine intent
         try:
@@ -127,7 +143,7 @@ def process_whatsapp_inbound(
                 # Parse the clarification response to extract time/date info
                 # Combine original text with clarification for proper context
                 combined_text = pending_context["original_text"] + " " + text
-                clarification_parsed = asyncio.run(pipeline.parse_message(combined_text, user.timezone))
+                clarification_parsed = run_async(pipeline.parse_message(combined_text, user.timezone))
                 
                 # Use the original task info but update with clarification
                 intent = pending_context["intent"]
@@ -166,7 +182,7 @@ def process_whatsapp_inbound(
                            user.id, title, datetime_obj)
             else:
                 # Normal message processing
-                parsed = asyncio.run(pipeline.parse_message(text, user.timezone, user_id=str(user.id)))
+                parsed = run_async(pipeline.parse_message(text, user.timezone, user_id=str(user.id)))
             logger.info("NLP parsed message: intent='%s', title='%s', datetime='%s'", parsed.intent, parsed.title, parsed.datetime)
             print("Parsed intent:", parsed.intent, "for message:", text)
 
@@ -174,7 +190,7 @@ def process_whatsapp_inbound(
                 # Send agenda selection template
                 try:
                     client = WhatsAppMetaClient()
-                    asyncio.run(client.send_agenda_select_template(phone))
+                    run_async(client.send_agenda_select_template(phone))
                     return
                 except Exception as e:
                     logger.error("Failed to send agenda select template: %s", e)
@@ -223,7 +239,7 @@ def process_whatsapp_inbound(
                 # Send template
                 try:
                     client = WhatsAppMetaClient()
-                    asyncio.run(client.send_tasks_day_template(phone, tasks_list))
+                    run_async(client.send_tasks_day_template(phone, tasks_list))
                     return
                 except Exception as e:
                     logger.error("Failed to send tasks day template: %s", e)
@@ -290,7 +306,7 @@ def process_whatsapp_inbound(
                 # Send template
                 try:
                     client = WhatsAppMetaClient()
-                    asyncio.run(client.send_tasks_week_template(phone, tasks_list))
+                    run_async(client.send_tasks_week_template(phone, tasks_list))
                     return
                 except Exception as e:
                     logger.error("Failed to send tasks week template: %s", e)
@@ -338,31 +354,99 @@ def process_whatsapp_inbound(
                 )
 
             elif parsed.intent == "schedule_notification":
-                # Schedule a custom notification
-                from datetime import datetime, timedelta
+                # Schedule a custom notification and create a task
+                from datetime import timedelta
+                from app.core.time import now_utc, resolve_timezone
+                from app.services.reminder_analyzer import ReminderAnalyzer
                 
-                # Extract the message (remove notification keywords)
-                notification_keywords = ["уведоми", "напомни", "remind", "notify", "напоминание", "уведомление"]
-                message_text = text
-                for keyword in notification_keywords:
-                    message_text = message_text.replace(keyword, "").strip()
+                # Use ReminderAnalyzer to parse the message
+                analyzer = ReminderAnalyzer()
+                analysis = analyzer.analyze(text)
                 
-                # Parse the time from the message
+                # Parse the time from the message using analysis
                 reminder_service = ReminderService(db)
                 
-                notify_time = reminder_service.parse_notification_text(text, user.timezone, now_utc())
+                # Use notification_time from analysis if available
+                notify_time = None
+                if analysis.notification_time:
+                    from datetime import datetime
+                    try:
+                        notify_time = datetime.fromisoformat(analysis.notification_time)
+                    except:
+                        pass
+                
+                # Fallback to parse_notification_text if analysis didn't provide time
+                if not notify_time:
+                    notify_time = reminder_service.parse_notification_text(text, user.timezone, now_utc())
                 
                 if notify_time:
+                    # Create a task with the event time if available
+                    task_service = TaskService(db)
+                    event_time = None
+                    
+                    # Try to get event_time from analysis
+                    if analysis.event_time:
+                        from datetime import datetime
+                        try:
+                            event_time = datetime.fromisoformat(analysis.event_time)
+                        except:
+                            pass
+                    
+                    # Create the task
+                    from app.db.models import TaskPriority
+                    task = task_service.create_task(
+                        TaskCreate(
+                            user_id=user.id,
+                            title=analysis.reminder_text if analysis.reminder_text else "Напоминание",
+                            description=None,
+                            due_at=event_time,
+                            priority=TaskPriority.MEDIUM
+                        )
+                    )
+                    
                     # Schedule the notification
                     success = reminder_service.schedule_custom_notification(
                         user_id=user.id,
-                        message=message_text if message_text else "Напоминание",
+                        message=analysis.reminder_text if analysis.reminder_text else "Напоминание",
                         notify_at=notify_time,
                         title="Напоминание"
                     )
                     
                     if success:
-                        time_str = notify_time.strftime("%d.%m %H:%M")
+                        # Convert times to user's timezone for display
+                        local_tz = resolve_timezone(user.timezone)
+                        notify_time_local = notify_time.replace(tzinfo=timezone.utc).astimezone(local_tz)
+                        
+                        # Format time in user's timezone
+                        time_str = notify_time_local.strftime("%d.%m %H:%M")
+                        
+                        # Send task created template
+                        try:
+                            client = WhatsAppMetaClient()
+                            due_date_str = ""
+                            if event_time:
+                                event_time_local = event_time.replace(tzinfo=timezone.utc).astimezone(local_tz)
+                                due_date_str = event_time_local.strftime("%d.%m %H:%M")
+                            
+                            components = [
+                                {
+                                    "type": "body",
+                                    "parameters": [
+                                        {"type": "text", "text": task.title},
+                                        {"type": "text", "text": due_date_str if due_date_str else "не указан"},
+                                    ]
+                                }
+                            ]
+                            run_async(client.send_template(
+                                to=phone,
+                                template_name="task_bot_task_created",
+                                language_code="ru",
+                                components=components,
+                            ))
+                        except Exception as e:
+                            logger.error("Failed to send task created template: %s", e)
+                        
+                        # Send reminder scheduled notification
                         confirmation = f"✅ Напоминание запланировано на {time_str}! Я напишу вам в это время."
                     else:
                         confirmation = "❌ Не удалось запланировать напоминание. Попробуйте еще раз."
@@ -491,7 +575,7 @@ def process_whatsapp_inbound(
                 logger.info("Message intent: %s - no task detected, sending welcome template", parsed.intent)
                 try:
                     client = WhatsAppMetaClient()
-                    asyncio.run(client.send_welcome_template(phone))
+                    run_async(client.send_welcome_template(phone))
                     return  # Exit early, template already sent
                 except Exception as e:
                     logger.error("Failed to send welcome template: %s", e)
@@ -537,7 +621,7 @@ def process_whatsapp_inbound(
                     # Send template
                     try:
                         client = WhatsAppMetaClient()
-                        asyncio.run(client.send_task_created_template(phone, task.title, due_date_display))
+                        run_async(client.send_task_created_template(phone, task.title, due_date_display))
                         return
                     except Exception as e:
                         logger.error("Failed to send task created template: %s", e)
@@ -596,7 +680,7 @@ def process_whatsapp_inbound(
                     # Send template
                     try:
                         client = WhatsAppMetaClient()
-                        asyncio.run(client.send_task_created_template(phone, f"Событие: {parsed.title}", event_date_display))
+                        run_async(client.send_task_created_template(phone, f"Событие: {parsed.title}", event_date_display))
                         return
                     except Exception as e:
                         logger.error("Failed to send event created template: %s", e)
@@ -619,20 +703,20 @@ def process_whatsapp_inbound(
                 try:
                     # Use Gemini to generate a conversational response
                     gemini = GeminiClient()
-                    confirmation = asyncio.run(gemini.chat(text, user.timezone))
+                    confirmation = run_async(gemini.chat(text, user.timezone))
                 except Exception as e:
                     logger.error("Chat generation failed: %s", e)
                     # Fallback to welcome template
                     try:
                         client = WhatsAppMetaClient()
-                        asyncio.run(client.send_welcome_template(phone))
+                        run_async(client.send_welcome_template(phone))
                         return  # Exit early, template already sent
                     except Exception as template_error:
                         logger.error("Failed to send welcome template: %s", template_error)
                         # Try one more time
                         try:
                             client = WhatsAppMetaClient()
-                            asyncio.run(client.send_welcome_template(phone))
+                            run_async(client.send_welcome_template(phone))
                             return
                         except Exception:
                             pass  # Give up, no more fallbacks
@@ -664,7 +748,7 @@ def process_whatsapp_inbound(
         
         try:
             whatsapp_client = WhatsAppMetaClient()
-            asyncio.run(whatsapp_client.send_text(recipient_phone, confirmation))
+            run_async(whatsapp_client.send_text(recipient_phone, confirmation))
             logger.info("Confirmation sent to %s (original sender: %s): %s", recipient_phone, phone, confirmation)
         except Exception as e:
             logger.error("Failed to send confirmation: %s", str(e))
@@ -771,7 +855,7 @@ def process_email_inbound(payload: dict) -> None:
             return
 
         pipeline = NLPPipeline()
-        parsed = asyncio.run(pipeline.parse_message(text, user.timezone))
+        parsed = run_async(pipeline.parse_message(text, user.timezone))
 
         task = Task(
             user_id=user.id,

@@ -663,9 +663,13 @@ class ReminderService:
         Parse natural language notification time from text.
         Handles formats like:
         - "через 1 минуту" / "in 1 minute"
-        - "через 30 минут" / "in 30 minutes" 
+        - "через 30 минут" / "in 30 minutes"
         - "через 2 часа" / "in 2 hours"
         - "в 15:00" / "at 15:00"
+        - "в 15 50" / "at 15 50" (space-separated time)
+        - "за 10 минут до 15:50" / "10 minutes before 15:50"
+        - "напомни за 10 минут в 15:50" / "remind 10 minutes at 15:50"
+        - "В 15 50... напомни за 10 минут" / "At 15:50... remind 10 minutes before"
         - "завтра в 10:00" / "tomorrow at 10:00"
         
         Returns:
@@ -676,16 +680,64 @@ class ReminderService:
         
         text_lower = text.lower().strip()
         
+        # Try "за X минут" pattern combined with a time in the text
+        # e.g., "В 15 50 надо поплакать, напомни за 10 минут" -> 15:40
+        # Also handles singular forms: "за час", "за минуту", "за день" (defaults to 1)
+        before_time_match = re.search(r'за\s+(?:(\d+)\s+)?(минуту|минут|мин|час|часа|часов|день|дня|дней)\s*(?:в|во|до|до\s+вр|к)?\s*(\d{1,2})[:\s](\d{2})', text_lower)
+        if before_time_match:
+            # Default to 1 if no number provided (e.g., "за час" = 1 hour)
+            value = int(before_time_match.group(1)) if before_time_match.group(1) else 1
+            unit = before_time_match.group(2)
+            hour = int(before_time_match.group(3))
+            minute = int(before_time_match.group(4))
+            
+            # Create target time
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= now:
+                target = target + timedelta(days=1)
+            
+            # Subtract the offset
+            if unit in ["минута", "минуту", "минут", "мин"]:
+                return target - timedelta(minutes=value)
+            elif unit in ["час", "часа", "часов"]:
+                return target - timedelta(hours=value)
+            elif unit in ["день", "дня", "дней"]:
+                return target - timedelta(days=value)
+        
+        # Try "за X минут" with time BEFORE it in the text
+        # e.g., "В 15 50 надо поплакать, напомни за 10 минут"
+        # Also handles singular forms: "за час", "за минуту", "за день" (defaults to 1)
+        time_match_first = re.search(r'(?:в|at|к)\s+(\d{1,2})[:\s](\d{2})', text_lower)
+        before_offset_match = re.search(r'за\s+(?:(\d+)\s+)?(минуту|минут|мин|час|часа|часов|день|дня|дней)', text_lower)
+        
+        if time_match_first and before_offset_match:
+            hour = int(time_match_first.group(1))
+            minute = int(time_match_first.group(2))
+            # Default to 1 if no number provided (e.g., "за час" = 1 hour)
+            value = int(before_offset_match.group(1)) if before_offset_match.group(1) else 1
+            unit = before_offset_match.group(2)
+            
+            # Create target time
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= now:
+                target = target + timedelta(days=1)
+            
+            # Subtract the offset
+            if unit in ["минута", "минуту", "минут", "мин"]:
+                return target - timedelta(minutes=value)
+            elif unit in ["час", "часа", "часов"]:
+                return target - timedelta(hours=value)
+            elif unit in ["день", "дня", "дней"]:
+                return target - timedelta(days=value)
+        
         # Try relative time parsing first
         # "через X минуту/минут/часа/часов/дней"
-        relative_match = re.search(r'через\s+(\d+)\s+(минуту|минут|час|часа|часов|день|дня|дней)', text_lower)
+        relative_match = re.search(r'через\s+(\d+)\s+(минуту|минут|мин|час|часа|часов|день|дня|дней)', text_lower)
         if relative_match:
             value = int(relative_match.group(1))
             unit = relative_match.group(2)
             
-            if unit in ["минута", "минуту"]:
-                return now + timedelta(minutes=value)
-            elif unit in ["минут", "мин"]:
+            if unit in ["минута", "минуту", "минут", "мин"]:
                 return now + timedelta(minutes=value)
             elif unit in ["час", "часа", "часов"]:
                 return now + timedelta(hours=value)
@@ -693,7 +745,7 @@ class ReminderService:
                 return now + timedelta(days=value)
         
         # English relative time
-        relative_match_en = re.search(r'in\s+(\d+)\s+(minute|minutes|hour|hours|day|days)', text_lower)
+        relative_match_en = re.search(r'in\s+(\d+)\s+(minute|minutes|min|hour|hours|hr|hrs|day|days)', text_lower)
         if relative_match_en:
             value = int(relative_match_en.group(1))
             unit = relative_match_en.group(2)
@@ -705,11 +757,12 @@ class ReminderService:
             elif unit in ["day", "days"]:
                 return now + timedelta(days=value)
         
-        # Try absolute time parsing (e.g., "в 15:00", "at 15:00")
-        time_match = re.search(r'(?:в|at|к)\s+(\d{1,2}):?(\d{2})?', text_lower)
+        # Try absolute time parsing (e.g., "в 15:00", "в 15 50", "at 15:00")
+        # Support both colon and space as separators
+        time_match = re.search(r'(?:в|at|к)\s+(\d{1,2})[:\s](\d{2})', text_lower)
         if time_match:
             hour = int(time_match.group(1))
-            minute = int(time_match.group(2)) if time_match.group(2) else 0
+            minute = int(time_match.group(2))
             
             # Create datetime for today at specified time
             target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)

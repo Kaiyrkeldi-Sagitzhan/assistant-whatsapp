@@ -167,3 +167,4 @@ class Reminder(Base):
     status: Mapped[ReminderStatus] = mapped_column(
         SqlEnum(ReminderStatus), nullable=False, default=ReminderStatus.SCHEDULED
     )
+    description: Mapped[Union[str, None]] = mapped_column(Text, nullable=True)
