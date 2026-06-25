@@ -79,10 +79,8 @@ class NLPPipeline:
                 confidence=0.9,
             )
         else:
-            # First try rule-based time extraction for better accuracy
-            rule_datetime = self._extract_datetime_from_text(text, timezone)
-
             # Use Gemini for task creation and complex parsing with timeout
+            # This allows Gemini to classify the intent (create_task, create_event, etc.)
             try:
                 import asyncio
                 extracted: dict[str, Any] = await asyncio.wait_for(
@@ -91,6 +89,9 @@ class NLPPipeline:
                 )
                 
                 intent = str(extracted.get("intent", "create_task"))
+
+                # First try rule-based time extraction for better accuracy
+                rule_datetime = self._extract_datetime_from_text(text, timezone)
 
                 # Handle unknown intents - check if it might be a task using rule-based parsing
                 if intent == "unknown":
@@ -155,7 +156,7 @@ class NLPPipeline:
                 title = self._clean_title(text.strip()[:50])
                 description = text
                 confidence = 0.3
-                datetime_obj = rule_datetime
+                datetime_obj = self._extract_datetime_from_text(text, timezone)
             except Exception as e:
                 # Fallback for any other Gemini errors
                 logger.warning("Gemini API error (%s), using rule-based fallback for: %s", e, text)
@@ -163,7 +164,7 @@ class NLPPipeline:
                 title = self._clean_title(text.strip()[:50])
                 description = text
                 confidence = 0.3
-                datetime_obj = rule_datetime
+                datetime_obj = self._extract_datetime_from_text(text, timezone)
 
             # Check if clarification is needed
             clarification = self._check_needs_clarification(title, datetime_obj, text, intent)

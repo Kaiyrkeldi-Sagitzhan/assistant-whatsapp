@@ -38,17 +38,17 @@ class TaskService:
         # Auto-create reminders for the task
         from app.services.reminder_service import ReminderService
         reminder_service = ReminderService(self.db)
-        # If a custom reminder time is provided, use it; otherwise fallback to default behavior
-        if hasattr(payload, "reminder_time") and payload.reminder_time:
-            # Create a single reminder at the custom time
-            reminder_service.create_reminder(
-                user_id=payload.user_id,
-                task_id=task.id,
-                remind_at=payload.reminder_time,
-                kind=ReminderKind.EXACT,
-            )
-        else:
-            reminder_service.auto_create_reminders_for_all_tasks(task)
+        reminder_service.auto_create_reminders_for_all_tasks(task)
+        
+        # Send first reminder about the created task
+        try:
+            # Use hello_world template for events, default for tasks
+            if parsed_intent == "create_event":
+                reminder_service.send_first_reminder(task, template="hello_world")
+            else:
+                reminder_service.send_first_reminder(task, template="default")
+        except Exception as e:
+            logger.warning(f"Failed to send first reminder for task {task.id}: {e}")
         
         return task
 

@@ -71,7 +71,7 @@ DATETIME EXTRACTION (only for create_task/create_event/schedule_notification):
 - Return datetime in ISO format: "2026-04-22T15:00:00"
 
 EXTRACTION RULES:
-- title: Clear, concise task/event name (max 50 chars, 1-3 words) - ONLY for create_task/create_event
+- title: Clear, concise task/event name max 50 chars, 1-3 words) - ONLY for create_task/create_event
 - datetime: ISO format (YYYY-MM-DDTHH:MM:SS) or null - ONLY extract if clearly mentioned
 - description: Full original message text
 

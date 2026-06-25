@@ -254,8 +254,16 @@ class ReminderAnalyzer:
             target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
             return target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         
+        # Pattern: "завтра в HH MM" (space-separated time)
+        match = re.search(r'завтра\s+в\s+(\d{1,2})\s+(\d{2})', text)
+        if match:
+            hour, minute = int(match.group(1)), int(match.group(2))
+            target = now + timedelta(days=1)
+            target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            return target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        
         # Pattern: "завтра" (default to 9:00)
-        if 'завтра' in text and not re.search(r'в\s+\d{1,2}:\d{2}', text):
+        if 'завтра' in text and not re.search(r'в\s+\d{1,2}[: ]\d{2}', text):
             target = now + timedelta(days=1)
             target = target.replace(hour=9, minute=0, second=0, microsecond=0)
             return target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -266,12 +274,6 @@ class ReminderAnalyzer:
             target = target.replace(hour=9, minute=0, second=0, microsecond=0)
             return target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         
-        # Pattern: "через N дней" - this is relative, not absolute
-        # We should NOT return absolute time for this
-        
-        # Pattern: "через неделю" / "через две недели" - this is relative, not absolute
-        # We should NOT return absolute time for this
-        
         # Pattern: "DD month YYYY в HH:MM" or "DD month в HH:MM"
         for month_name, month_num in self.MONTHS_RU.items():
             match = re.search(rf'(\d{{1,2}})\s+{month_name}(?:\s+(\d{{4}}))?(?:\s+в\s+(\d{{1,2}}):(\d{{2}}))?', text)
@@ -280,6 +282,21 @@ class ReminderAnalyzer:
                 year = int(match.group(2)) if match.group(2) else now.year
                 hour = int(match.group(3)) if match.group(3) else 9
                 minute = int(match.group(4)) if match.group(4) else 0
+                
+                try:
+                    target = now.replace(year=year, month=month_num, day=day, hour=hour, minute=minute, second=0, microsecond=0)
+                    return target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                except ValueError:
+                    pass
+        
+        # Pattern: "DD month YYYY в HH MM" (space-separated time)
+        for month_name, month_num in self.MONTHS_RU.items():
+            match = re.search(rf'(\d{{1,2}})\s+{month_name}(?:\s+(\d{{4}}))?\s+в\s+(\d{{1,2}})\s+(\d{{2}})', text)
+            if match:
+                day = int(match.group(1))
+                year = int(match.group(2)) if match.group(2) else now.year
+                hour = int(match.group(3))
+                minute = int(match.group(4))
                 
                 try:
                     target = now.replace(year=year, month=month_num, day=day, hour=hour, minute=minute, second=0, microsecond=0)
@@ -299,6 +316,37 @@ class ReminderAnalyzer:
                 return target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
             except ValueError:
                 pass
+        
+        # Pattern: "DD.MM.YYYY в HH MM" (space-separated time)
+        match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})\s+в\s+(\d{1,2})\s+(\d{2})', text)
+        if match:
+            day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            hour = int(match.group(4))
+            minute = int(match.group(5))
+            
+            try:
+                target = now.replace(year=year, month=month, day=day, hour=hour, minute=minute, second=0, microsecond=0)
+                return target.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                pass
+        
+        # Pattern: "в HH:MM" (time today)
+        match = re.search(r'в\s+(\d{1,2}):(\d{2})', text)
+        if match:
+            hour, minute = int(match.group(1)), int(match.group(2))
+            event_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if event_time < now:
+                event_time = event_time + timedelta(days=1)
+            return event_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        
+        # Pattern: "в HH MM" (space-separated time)
+        match = re.search(r'в\s+(\d{1,2})\s+(\d{2})', text)
+        if match:
+            hour, minute = int(match.group(1)), int(match.group(2))
+            event_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if event_time < now:
+                event_time = event_time + timedelta(days=1)
+            return event_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         
         return None
     
@@ -370,8 +418,41 @@ class ReminderAnalyzer:
                 "event_time": event_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             }
         
+        # Check for "завтра в HH MM" pattern with offset (space-separated time)
+        match = re.search(r'завтра\s+в\s+(\d{1,2})\s+(\d{2})', text)
+        if match:
+            hour, minute = int(match.group(1)), int(match.group(2))
+            event_time = now + timedelta(days=1)
+            event_time = event_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            
+            notification_time = event_time - timedelta(minutes=offset_minutes)
+            # Convert to UTC for consistent parsing
+            return {
+                "notification_time": notification_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+                "offset_minutes": offset_minutes,
+                "event_time": event_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+        
         # Check for "в HH:MM" pattern (time today) - least specific
         match = re.search(r'в\s+(\d{1,2}):(\d{2})', text)
+        if match:
+            hour, minute = int(match.group(1)), int(match.group(2))
+            # Use today's date
+            event_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # If the time has already passed today, assume it's for tomorrow
+            if event_time < now:
+                event_time = event_time + timedelta(days=1)
+            
+            notification_time = event_time - timedelta(minutes=offset_minutes)
+            # Convert to UTC for consistent parsing
+            return {
+                "notification_time": notification_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+                "offset_minutes": offset_minutes,
+                "event_time": event_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+        
+        # Check for "в HH MM" pattern (space-separated time) - for Kazakh format
+        match = re.search(r'в\s+(\d{1,2})\s+(\d{2})', text)
         if match:
             hour, minute = int(match.group(1)), int(match.group(2))
             # Use today's date
