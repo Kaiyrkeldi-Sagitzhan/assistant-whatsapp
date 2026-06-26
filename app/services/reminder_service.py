@@ -58,8 +58,14 @@ class ReminderService:
         self.db.refresh(reminder)
         return reminder
 
-    def auto_create_reminders(self, task: Task) -> None:
-        """Automatically create reminders for all tasks: 30 min before and at exact time."""
+    def auto_create_reminders(self, task: Task, custom_offset_minutes: Union[int, None] = None) -> None:
+        """Automatically create reminders for all tasks: custom offset before and at exact time.
+        
+        Args:
+            task: The task to create reminders for
+            custom_offset_minutes: Custom offset in minutes for the before-deadline reminder.
+                               Defaults to 30 minutes if not specified.
+        """
         if not task.due_at:
             return
 
@@ -70,12 +76,15 @@ class ReminderService:
         if task.due_at < now:
             return
 
-        # 30 minutes before reminder (only if due time is at least 30 minutes in the future)
-        if task.due_at > now + timedelta(minutes=30):
+        # Use custom offset or default to 30 minutes
+        offset = custom_offset_minutes if custom_offset_minutes is not None else 30
+
+        # Before-deadline reminder (only if due time is at least offset minutes in the future)
+        if task.due_at > now + timedelta(minutes=offset):
             self.create_reminder(
                 user_id=user_id,
                 task_id=task.id,
-                remind_at=task.due_at - timedelta(minutes=30),
+                remind_at=task.due_at - timedelta(minutes=offset),
                 kind=ReminderKind.BEFORE_DEADLINE,
             )
 
@@ -148,8 +157,14 @@ class ReminderService:
         ).order_by(Task.due_at.asc())
         return list(self.db.scalars(stmt).all())
 
-    def auto_create_reminders_for_all_tasks(self, task: Task) -> None:
-        """Automatically create reminders for all tasks: 30 min before and at exact time."""
+    def auto_create_reminders_for_all_tasks(self, task: Task, custom_offset_minutes: Union[int, None] = None) -> None:
+        """Automatically create reminders for all tasks: custom offset before and at exact time.
+        
+        Args:
+            task: The task to create reminders for
+            custom_offset_minutes: Custom offset in minutes for the before-deadline reminder.
+                               Defaults to 30 minutes if not specified.
+        """
         if not task.due_at:
             return
 
@@ -160,12 +175,15 @@ class ReminderService:
         if task.due_at < now:
             return
 
-        # 30 minutes before reminder (only if due time is at least 30 minutes in the future)
-        if task.due_at > now + timedelta(minutes=30):
+        # Use custom offset or default to 30 minutes
+        offset = custom_offset_minutes if custom_offset_minutes is not None else 30
+
+        # Before-deadline reminder (only if due time is at least offset minutes in the future)
+        if task.due_at > now + timedelta(minutes=offset):
             self.create_reminder(
                 user_id=user_id,
                 task_id=task.id,
-                remind_at=task.due_at - timedelta(minutes=30),
+                remind_at=task.due_at - timedelta(minutes=offset),
                 kind=ReminderKind.BEFORE_DEADLINE,
             )
 

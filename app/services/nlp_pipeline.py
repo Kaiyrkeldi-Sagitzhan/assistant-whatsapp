@@ -26,6 +26,7 @@ class ParsedMessage:
     clarification_type: str = ""  # "time", "date", "title", "details"
     clarification_question: str = ""
     priority: Union[str, None] = None  # For update_priority intent
+    custom_reminder_offset_minutes: Union[int, None] = None  # Custom reminder offset (e.g., "за 2 часа" = 120)
 
 
 class NLPPipeline:
@@ -193,6 +194,9 @@ class NLPPipeline:
                     clarification_question=clarification["question"],
                 )
 
+            # Extract custom reminder offset if specified
+            custom_offset = self._extract_custom_reminder_offset(text)
+            
             return ParsedMessage(
                 intent=intent,
                 title=title,
@@ -200,6 +204,7 @@ class NLPPipeline:
                 description=description,
                 due_at=datetime_obj,
                 confidence=confidence,
+                custom_reminder_offset_minutes=custom_offset,
             )
 
     def _detect_intent(self, text: str) -> str:
@@ -593,6 +598,83 @@ class NLPPipeline:
 
         # Fallback to relative date extraction
         return self._normalize_date(None, text, timezone)
+
+    def _extract_custom_reminder_offset(self, text: str) -> Union[int, None]:
+        """
+        Extract custom reminder offset in minutes from text.
+        Handles patterns like:
+        - "за 2 часа" / "за два часа" -> 120 minutes
+        - "за 30 минут" / "за тридцать минут" -> 30 minutes
+        - "за час" -> 60 minutes (default to 1)
+        - "за минуту" -> 1 minute (default to 1)
+        - "за день" -> 1440 minutes
+        
+        Returns:
+            Offset in minutes or None if not found
+        """
+        text_lower = text.lower()
+        
+        # Time unit mappings to minutes
+        time_units = {
+            'минута': 1, 'минуты': 1, 'минут': 1, 'минуту': 1,
+            'час': 60, 'часа': 60, 'часов': 60,
+            'день': 1440, 'дня': 1440, 'дней': 1440,
+        }
+        
+        # Number word mappings for Russian
+        number_words = {
+            'один': 1, 'одна': 1, 'одно': 1,
+            'два': 2, 'две': 2,
+            'три': 3, 'тридцать': 30,
+            'четыре': 4, 'сорок': 40,
+            'пять': 5, 'пятьдесят': 50,
+            'шесть': 6, 'шестдесят': 60,
+            'семь': 7,
+            'восемь': 8,
+            'девять': 9,
+            'десять': 10,
+            'одиннадцать': 11,
+            'двенадцать': 12,
+            'тринадцать': 13,
+            'четырнадцать': 14,
+            'пятнадцать': 15,
+            'шестнадцать': 16,
+            'семнадцать': 17,
+            'восемнадцать': 18,
+            'девятнадцать': 19,
+            'двадцать': 20,
+            'тридцать': 30,
+            'сорок': 40,
+            'пятьдесят': 50,
+        }
+        
+        # Pattern: "за X минут/часов/дней" where X is a number
+        match = re.search(r'за\s+(\d+)\s+(минуту|минуты|минут|мин|час|часа|часов|день|дня|дней)', text_lower)
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2)
+            return value * time_units.get(unit, 1)
+        
+        # Pattern: "за X минут/часов/дней" where X is a word (e.g., "за два часа")
+        match = re.search(r'за\s+(один|одна|одно|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|одиннадцать|двенадцать|тринадцать|четырнадцать|пятнадцать|шестнадцать|семнадцать|восемнадцать|девятнадцать|двадцать|тридцать|сорок|пятьдесят)\s+(минуту|минуты|минут|мин|час|часа|часов|день|дня|дней)', text_lower)
+        if match:
+            value = number_words.get(match.group(1), 1)
+            unit = match.group(2)
+            return value * time_units.get(unit, 1)
+        
+        # Pattern: "за час" (without number) - defaults to 1
+        if re.search(r'за\s+час\b', text_lower):
+            return 60
+        
+        # Pattern: "за минуту" (without number) - defaults to 1
+        if re.search(r'за\s+минуту\b', text_lower):
+            return 1
+        
+        # Pattern: "за день" (without number) - defaults to 1
+        if re.search(r'за\s+день\b', text_lower):
+            return 1440
+        
+        return None
 
     def _clean_title(self, title: str) -> str:
         """Remove time and date expressions from title to keep it clean."""

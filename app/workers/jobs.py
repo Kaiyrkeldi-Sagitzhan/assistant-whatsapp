@@ -147,6 +147,8 @@ def process_whatsapp_inbound(
                 parsed.due_at = due_at
                 parsed.confidence = confidence
                 parsed.needs_clarification = False
+                # Extract custom reminder offset from combined text
+                parsed.custom_reminder_offset_minutes = pipeline._extract_custom_reminder_offset(combined_text)
                 
                 logger.info("Clarification processed for user %s: task='%s', datetime='%s'", 
                            user.id, title, datetime_obj)
@@ -385,7 +387,8 @@ def process_whatsapp_inbound(
                             due_at=parsed.datetime,
                             priority=TaskPriority.MEDIUM,  # Default priority
                         ),
-                        parsed_intent=parsed.intent
+                        parsed_intent=parsed.intent,
+                        custom_reminder_offset_minutes=parsed.custom_reminder_offset_minutes
                     )
                     logger.info("Task created: %s", task.title)
 
@@ -398,10 +401,6 @@ def process_whatsapp_inbound(
                     )
                     db.commit()
 
-                    # Auto-create reminders if needed
-                    reminder_service = ReminderService(db)
-                    reminder_service.auto_create_reminders(task)
-
                     # Format due date in user's timezone
                     due_time_display = "не указан"
                     if task.due_at:
@@ -411,7 +410,9 @@ def process_whatsapp_inbound(
                         local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
                         due_time_display = local_due_at.strftime('%d.%m %H:%M')
 
-                    reminder_info = "🔄 Напомню за 30 минут" if task.due_at else "📝 Задача без дедлайна"
+                    # Show custom reminder offset in confirmation
+                    offset_display = parsed.custom_reminder_offset_minutes if parsed.custom_reminder_offset_minutes else 30
+                    reminder_info = f"🔄 Напомню за {offset_display} минут" if task.due_at else "📝 Задача без дедлайна"
                     confirmation = (
                         f"✅ Отлично! Задача '{task.title}' создана.\n"
                         f"📅 Срок: {due_time_display}\n"
@@ -435,7 +436,8 @@ def process_whatsapp_inbound(
                             due_at=parsed.datetime,
                             priority=TaskPriority.HIGH,  # Events are important
                         ),
-                        parsed_intent=parsed.intent
+                        parsed_intent=parsed.intent,
+                        custom_reminder_offset_minutes=parsed.custom_reminder_offset_minutes
                     )
                     logger.info("Event created as task: %s", task.title)
 
@@ -457,9 +459,12 @@ def process_whatsapp_inbound(
                         local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
                         event_time_display = local_due_at.strftime('%d.%m %H:%M')
 
+                    # Show custom reminder offset in confirmation
+                    offset_display = parsed.custom_reminder_offset_minutes if parsed.custom_reminder_offset_minutes else 30
                     confirmation = (
                         f"✅ Отлично! Встреча '{parsed.title}' запланирована.\n"
                         f"📅 Время: {event_time_display}\n"
+                        f"🔔 Напомню за {offset_display} минут\n"
                         f"🔥 Высокий приоритет - не забудьте подготовиться!\n"
                         f"📅 Хотите посмотреть повестку дня? Просто скажите 'повестка'"
                     )

@@ -17,7 +17,7 @@ class TaskService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def create_task(self, payload: TaskCreate, parsed_intent: str = "create_task") -> Task:
+    def create_task(self, payload: TaskCreate, parsed_intent: str = "create_task", custom_reminder_offset_minutes: Union[int, None] = None) -> Task:
         user = self.db.get(User, payload.user_id)
         if user is None:
             user = User(id=payload.user_id)
@@ -38,7 +38,7 @@ class TaskService:
         # Auto-create reminders for the task
         from app.services.reminder_service import ReminderService
         reminder_service = ReminderService(self.db)
-        reminder_service.auto_create_reminders_for_all_tasks(task)
+        reminder_service.auto_create_reminders_for_all_tasks(task, custom_offset_minutes=custom_reminder_offset_minutes)
         
         # Send first reminder about the created task
         try:
