@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.db.models import TaskPriority, TaskStatus
 
@@ -23,6 +23,8 @@ class TaskUpdate(BaseModel):
     reminder_time: Union[datetime, None] = None  # Add to update schema
 
 class TaskResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     user_id: uuid.UUID
     title: str
@@ -40,6 +42,8 @@ class CustomReminderCreate(BaseModel):
 
 
 class CustomReminderResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     user_id: uuid.UUID
     title: str

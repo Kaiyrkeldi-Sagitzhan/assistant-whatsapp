@@ -20,17 +20,17 @@ def verify_whatsapp(
     hub_verify_token: str = Query(alias="hub.verify_token"),
     hub_challenge: str = Query(alias="hub.challenge"),
 ) -> str:
-    logger.info(f"WhatsApp verification request: mode={hub_mode}, token={hub_verify_token}, challenge={hub_challenge}")
+    logger.info("WhatsApp verification request: mode=%s, challenge=%s", hub_mode, hub_challenge)
     if hub_mode == "subscribe" and hub_verify_token == settings.whatsapp_verify_token:
         logger.info("WhatsApp verification successful")
         return hub_challenge
-    logger.error(f"WhatsApp verification failed: mode={hub_mode}, expected_token={settings.whatsapp_verify_token}, received_token={hub_verify_token}")
+    logger.warning("WhatsApp verification failed: mode=%s", hub_mode)
     raise HTTPException(status_code=403, detail="Invalid verify token")
 
 
 @router.post("/whatsapp")
 def inbound_whatsapp(webhook_payload: dict) -> dict[str, str]:
-    logger.info("Received WhatsApp webhook: %s", webhook_payload)
+    logger.info("Received WhatsApp webhook")
     # Parse Meta Cloud API webhook format
     try:
         changes = webhook_payload.get("entry", [{}])[0].get("changes", [{}])[0]

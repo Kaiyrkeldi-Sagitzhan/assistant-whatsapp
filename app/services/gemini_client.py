@@ -4,6 +4,7 @@ import logging
 import asyncio
 from typing import Any, Optional
 
+from google.api_core import exceptions as google_exceptions
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
 from pydantic import ValidationError
@@ -19,6 +20,17 @@ from app.core.time import now_utc
 from app.schemas.gemini import ExtractedTask, ChatResponse
 
 logger = logging.getLogger(__name__)
+
+
+RETRYABLE_GEMINI_ERRORS = (
+    google_exceptions.DeadlineExceeded,
+    google_exceptions.InternalServerError,
+    google_exceptions.ServiceUnavailable,
+)
+
+
+def _is_configured_key(api_key: str) -> bool:
+    return bool(api_key and api_key != "replace_me")
 
 
 class GeminiClient:
@@ -37,6 +49,12 @@ class GeminiClient:
         settings = get_settings()
         self.api_key = settings.gemini_api_key
         self.model_name = settings.gemini_model
+        self.enabled = _is_configured_key(self.api_key)
+        if not self.enabled:
+            logger.warning("Gemini API key is not configured; rule-based fallback will be used.")
+            self.model = None
+            self.safety_settings = []
+            return
         
         # Configure Generative AI
         genai.configure(api_key=self.api_key)
@@ -63,13 +81,15 @@ class GeminiClient:
         ]
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((Exception,)),
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        retry=retry_if_exception_type(RETRYABLE_GEMINI_ERRORS),
     )
     def _extract_task_internal(self, text: str, timezone: str) -> dict[str, Any]:
         """Internal method with retry decorator for extract_task."""
         current_date = now_utc().strftime("%Y-%m-%d")
+        if not self.enabled or self.model is None:
+            raise RuntimeError("Gemini is not configured")
         
         prompt = f"""You are an AI assistant for task management in Kazakhstan. Parse the user's message and return JSON data.
 
@@ -97,11 +117,11 @@ DATETIME HANDLING:
 - Return null if datetime not mentioned
 
 CRITICAL EXAMPLES:
-1. "Купить молоко завтра в 10" → create_task, title="Купить молоко", datetime="2026-04-23T10:00:00"
-2. "Встреча с боссом в 15 часов завтра" → create_event, title="Встреча с боссом", datetime="2026-04-23T15:00:00"
-3. "Напомни в 15:00" → schedule_notification, title="Напоминание", datetime="2026-04-22T15:00:00"
+1. "Купить молоко завтра в 10" → create_task, title="Купить молоко", datetime based on current date + 1 day at 10:00
+2. "Встреча с боссом завтра в 15 часов" → create_event, title="Встреча с боссом", datetime based on current date + 1 day at 15:00
+3. "Напомни в 15:00 проверить духовку" → schedule_notification, title="проверить духовку", datetime today at 15:00 or tomorrow if already past
 4. "Как дела?" → unknown, title="", datetime=null
-5. "В 15 часов встреча, напомни за 2 часа" → schedule_notification, title="Встреча", datetime="2026-04-22T13:00:00"
+5. "В 15:00 встреча, напомни за 2 часа" → schedule_notification, title="Встреча", datetime two hours before 15:00
 
 STRICT RULES:
 - If message doesn't contain a clear actionable task/event → intent: "unknown"
@@ -127,16 +147,16 @@ User message: "{text}"
             )
             
             response_text = response.text
-            logger.debug(f"Gemini raw response: {response_text}")
+            logger.debug("Gemini raw response: %s", response_text)
             
             # Parse response with Pydantic validation
             try:
                 task = ExtractedTask.model_validate_json(response_text)
                 result = task.model_dump()
-                logger.info(f"Successfully extracted task: intent={result['intent']}")
+                logger.info("Successfully extracted task: intent=%s", result["intent"])
                 return result
             except ValidationError as e:
-                logger.warning(f"Validation error parsing Gemini response: {e}")
+                logger.warning("Validation error parsing Gemini response: %s", e)
                 # Return fallback with unknown intent
                 return {
                     "intent": "unknown",
@@ -148,7 +168,7 @@ User message: "{text}"
                 }
                 
         except Exception as e:
-            logger.error(f"Error in extract_task with Gemini: {e}", exc_info=True)
+            logger.warning("Error in extract_task with Gemini: %s", e)
             raise  # Let retry decorator handle it
 
     async def extract_task(self, text: str, timezone: str) -> dict[str, Any]:
@@ -175,7 +195,7 @@ User message: "{text}"
             )
             return result
         except Exception as e:
-            logger.error(f"extract_task failed after retries: {e}", exc_info=True)
+            logger.warning("extract_task failed; using rule-based fallback: %s", e)
             # Final graceful fallback
             return {
                 "intent": "unknown",
@@ -187,12 +207,15 @@ User message: "{text}"
             }
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((Exception,)),
+        stop=stop_after_attempt(1),
+        wait=wait_exponential(multiplier=1, min=1, max=2),
+        retry=retry_if_exception_type(RETRYABLE_GEMINI_ERRORS),
     )
     def _chat_internal(self, text: str, system_prompt: Optional[str] = None) -> str:
         """Internal method with retry decorator for chat."""
+        if not self.enabled or self.model is None:
+            raise RuntimeError("Gemini is not configured")
+
         if system_prompt is None:
             system_prompt = """You are a friendly task management assistant for Kazakhstani users. 
 Respond in Russian. Keep responses to 1-3 sentences. Use warm tone with occasional emojis.
@@ -213,10 +236,15 @@ Always be helpful and encourage task management."""
             return response.text
             
         except Exception as e:
-            logger.error(f"Error in chat with Gemini: {e}", exc_info=True)
+            logger.warning("Error in chat with Gemini: %s", e)
             raise  # Let retry decorator handle it
 
-    async def chat(self, text: str, system_prompt: Optional[str] = None) -> str:
+    async def chat(
+        self,
+        text: str,
+        timezone: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+    ) -> str:
         """
         Generate conversational response using Gemini API.
         
@@ -224,6 +252,7 @@ Always be helpful and encourage task management."""
         
         Args:
             text: User message
+            timezone: User timezone kept for compatibility with old call sites
             system_prompt: Optional system prompt override
             
         Returns:
@@ -238,9 +267,12 @@ Always be helpful and encourage task management."""
             )
             return response
         except Exception as e:
-            logger.error(f"chat failed after retries: {e}", exc_info=True)
+            logger.warning("chat failed; using local fallback: %s", e)
             # Final fallback message
-            return "Извините, я временно недоступен. Попробуйте позже. 😔"
+            return (
+                "Я на месте. Могу записать задачу, поставить напоминание или показать список задач. "
+                "Например: 'напомни через 10 минут проверить духовку'."
+            )
 
     async def is_healthy(self) -> bool:
         """
@@ -250,6 +282,8 @@ Always be helpful and encourage task management."""
             True if API is working, False otherwise
         """
         try:
+            if not self.enabled or self.model is None:
+                return False
             response = await asyncio.to_thread(
                 self.model.generate_content,
                 "Ответь одним словом: Привет",

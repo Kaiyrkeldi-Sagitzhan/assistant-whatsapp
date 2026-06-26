@@ -36,7 +36,7 @@ class NLPPipeline:
         # First check for rule-based intents (commands)
         intent = self._detect_intent(text)
 
-        if intent in ["agenda", "agenda_select", "daily_agenda", "weekly_plan", "list_tasks", "help"]:
+        if intent in ["agenda", "agenda_select", "daily_agenda", "weekly_plan", "list_tasks", "help", "unknown"]:
             # These are command intents, don't need Gemini parsing
             return ParsedMessage(
                 intent=intent,
@@ -70,12 +70,17 @@ class NLPPipeline:
                 priority=priority,
             )
         elif intent == "schedule_notification":
-            # Custom notification scheduling
+            # Custom notification scheduling is deterministic enough to parse locally.
+            from app.services.reminder_service import ReminderService
+
+            datetime_obj = ReminderService.parse_notification_text(text, timezone, now_utc())
+            title = ReminderService.extract_notification_message(text)
             return ParsedMessage(
                 intent=intent,
-                title="",
-                datetime=None,
-                description=text,
+                title=title,
+                datetime=datetime_obj,
+                description=title,
+                due_at=datetime_obj,
                 confidence=0.9,
             )
         else:
@@ -205,6 +210,21 @@ class NLPPipeline:
     def _detect_intent(self, text: str) -> str:
         """Detect intent from text using rule-based patterns."""
         text_lower = text.lower().strip()
+
+        if text_lower in [
+            "привет",
+            "здравствуйте",
+            "добрый день",
+            "доброе утро",
+            "добрый вечер",
+            "hello",
+            "hi",
+            "спасибо",
+            "ок",
+            "окей",
+            "понятно",
+        ]:
+            return "unknown"
 
         # Agenda select button responses (quick replies from template)
         if text_lower in ["день", "сегодня"]:

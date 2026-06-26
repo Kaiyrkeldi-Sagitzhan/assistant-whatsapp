@@ -1,12 +1,13 @@
 import logging
 import uuid
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Union
 
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
-from app.core.time import now_utc
+from app.core.time import now_utc, resolve_timezone, to_utc
 from app.db.models import Reminder, ReminderKind, ReminderStatus, Task, TaskPriority, TaskStatus, InboundMessage, InboundChannel
 
 logger = logging.getLogger(__name__)
@@ -202,6 +203,8 @@ class ReminderService:
             if task:
                 priority_emoji = {"critical": "🔥", "high": "⚡", "medium": "📌", "low": "📋"}.get(task.priority.value, "📋")
                 return f"⏰ {task.title} {priority_emoji}"
+            elif reminder.description:
+                return f"⏰ {reminder.description}"
             elif reminder.title:
                 return f"⏰ {reminder.title}"
             else:
@@ -213,7 +216,6 @@ class ReminderService:
                 total_days = total_hours // 24
                 priority_emoji = {"critical": "🔥", "high": "⚡", "medium": "📌", "low": "📋"}.get(task.priority.value, "📋")
                 # Format the due time
-                from app.core.time import resolve_timezone
                 local_tz = resolve_timezone("Asia/Almaty")
                 due_time_local = task.due_at.astimezone(local_tz)
                 due_time_str = due_time_local.strftime("%H:%M")
@@ -240,10 +242,11 @@ class ReminderService:
         description: Union[str, None] = None,
     ) -> Reminder:
         """Create a custom reminder not tied to a specific task."""
+        remind_at_utc = to_utc(remind_at, "Asia/Almaty")
         reminder = Reminder(
             user_id=user_id,
             task_id=None,
-            remind_at=remind_at,
+            remind_at=remind_at_utc,
             kind=ReminderKind.EXACT,
             status=ReminderStatus.SCHEDULED,
             title=title,
@@ -404,7 +407,6 @@ class ReminderService:
             # Hello world template for event reminders
             due_info = ""
             if task.due_at:
-                from app.core.time import resolve_timezone
                 local_tz = resolve_timezone(task.user.timezone if hasattr(task, 'user') and task.user else "Asia/Almaty")
                 local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
                 due_info = f"\n📅 Время события: {local_due_at.strftime('%d.%m %H:%M')}"
@@ -421,7 +423,6 @@ class ReminderService:
             # Default template
             due_info = ""
             if task.due_at:
-                from app.core.time import resolve_timezone
                 local_tz = resolve_timezone(task.user.timezone if hasattr(task, 'user') and task.user else "Asia/Almaty")
                 local_due_at = task.due_at.replace(tzinfo=timezone.utc).astimezone(local_tz)
                 due_info = f"\n📅 Срок: {local_due_at.strftime('%d.%m %H:%M')}"
@@ -603,20 +604,50 @@ class ReminderService:
             True if scheduled successfully, False otherwise
         """
         try:
+            notify_at_utc = to_utc(notify_at, "Asia/Almaty")
+            if notify_at_utc <= now_utc():
+                logger.warning("Refusing to schedule custom notification in the past: %s", notify_at_utc)
+                return False
+
             # Create a custom reminder
             reminder = self.create_custom_reminder(
                 user_id=user_id,
                 title=title,
-                remind_at=notify_at,
-                description=message
+                remind_at=notify_at_utc,
+                description=message or title,
             )
-            logger.info(f"Custom notification scheduled for user {user_id} at {notify_at}")
+            logger.info("Custom notification %s scheduled for user %s at %s", reminder.id, user_id, notify_at_utc)
             return True
         except Exception as e:
-            logger.error(f"Failed to schedule custom notification for user {user_id}: {e}")
+            logger.error("Failed to schedule custom notification for user %s: %s", user_id, e)
             return False
 
-    def parse_notification_text(self, text: str, timezone: str, now: datetime) -> Union[datetime, None]:
+    @staticmethod
+    def extract_notification_message(text: str) -> str:
+        """Extract the payload text from a natural language reminder command."""
+        cleaned = text.strip()
+        cleaned = re.sub(
+            r'\b(напомни|напомнить|уведоми|уведомить|remind|notify)\b(?:\s+(?:мне|меня))?',
+            '',
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        patterns = [
+            r'через\s+\d+\s+(?:минуту|минут|мин|час|часа|часов|день|дня|дней)',
+            r'in\s+\d+\s+(?:minute|minutes|min|hour|hours|hr|hrs|day|days)',
+            r'завтра\s+(?:в|к)?\s*\d{1,2}(?::|\s)?\d{0,2}',
+            r'(?:сегодня|послезавтра)\s+(?:в|к)?\s*\d{1,2}(?::|\s)?\d{0,2}',
+            r'(?:в|at|к)\s+\d{1,2}(?::|\s)\d{2}',
+            r'(?:в|at|к)\s+\d{1,2}\s*(?:час|часа|часов)\b',
+            r'за\s+(?:(?:\d+)\s+)?(?:минуту|минут|мин|час|часа|часов|день|дня|дней)',
+        ]
+        for pattern in patterns:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip(' ,.;:-')
+        return cleaned or "Напоминание"
+
+    @staticmethod
+    def parse_notification_text(text: str, timezone: str, now: datetime) -> Union[datetime, None]:
         """
         Parse natural language notification time from text.
         
@@ -635,10 +666,33 @@ class ReminderService:
         Returns:
             Parsed datetime or None if cannot parse
         """
-        from dateutil import parser as date_parser
-        import re
-        
         text_lower = text.lower().strip()
+        now_local = now.astimezone(resolve_timezone(timezone))
+
+        def local_target(days: int, hour: int, minute: int = 0) -> Union[datetime, None]:
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                return None
+            target_local = (now_local + timedelta(days=days)).replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+            if target_local <= now_local:
+                target_local = target_local + timedelta(days=1)
+            return to_utc(target_local, timezone)
+
+        # ============ PATTERN 0: Explicit day + time ============
+        day_time_match = re.search(
+            r'(сегодня|завтра|послезавтра)\s*(?:в|к)?\s*(\d{1,2})(?:[:\s](\d{2}))?\s*(?:час|часа|часов)?',
+            text_lower,
+        )
+        if day_time_match:
+            day_word = day_time_match.group(1)
+            days = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[day_word]
+            hour = int(day_time_match.group(2))
+            minute = int(day_time_match.group(3)) if day_time_match.group(3) else 0
+            return local_target(days, hour, minute)
         
         # ============ PATTERN 1: "за X минут/часов до HH:MM" ============
         # e.g., "В 15 50 надо поплакать, напомни за 10 минут" → 15:40
@@ -652,11 +706,10 @@ class ReminderService:
             unit = before_time_match.group(2)
             hour = int(before_time_match.group(3))
             minute = int(before_time_match.group(4))
-            
-            # Create target time
-            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if target <= now:
-                target = target + timedelta(days=1)
+
+            target = local_target(0, hour, minute)
+            if target is None:
+                return None
             
             # Subtract the offset
             if unit in ["минута", "минуту", "минут", "мин"]:
@@ -676,13 +729,12 @@ class ReminderService:
             minute = int(time_match_first.group(2))
             value = int(before_offset_match.group(1)) if before_offset_match.group(1) else 1
             unit = before_offset_match.group(2)
-            
-            # Create target time
-            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if target <= now:
-                target = target + timedelta(days=1)
-            
-            # Subtract the offset
+
+            target = local_target(0, hour, minute)
+            if target is None:
+                return None
+
+            # Subtract the offset from UTC instant
             if unit in ["минута", "минуту", "минут", "мин"]:
                 return target - timedelta(minutes=value)
             elif unit in ["час", "часа", "часов"]:
@@ -738,7 +790,6 @@ class ReminderService:
                 return None
             
             # Convert to user's timezone for proper time handling
-            from app.core.time import resolve_timezone, to_utc
             local_tz = resolve_timezone(timezone)
             now_local = now.astimezone(local_tz)
             
@@ -804,8 +855,6 @@ class ReminderService:
                     
                     # Check if this is a BEFORE_DEADLINE reminder and use template
                     if reminder.kind.value == "before_deadline" and task:
-                        from app.core.time import resolve_timezone
-                        
                         # Format due time
                         due_info = ""
                         if task.due_at:
@@ -839,4 +888,3 @@ class ReminderService:
                 self.update_reminder_status(reminder.id, ReminderStatus.FAILED)
         
         return sent_count
-

@@ -23,7 +23,6 @@ from app.integrations.calendar_google import GoogleCalendarSync
 from app.integrations.email_inbound import EmailInboundParser
 from app.integrations.whatsapp_meta import WhatsAppMetaClient
 from app.schemas.task import TaskCreate
-from app.services.gemini_client import GeminiClient
 from app.services.nlp_pipeline import NLPPipeline
 from app.services.reminder_service import ReminderService
 from app.services.context_manager import ConversationContext
@@ -107,7 +106,7 @@ async def _send_whatsapp_with_retry(phone: str, message: str) -> bool:
     """
     try:
         whatsapp_client = WhatsAppMetaClient()
-        
+
         # Convert phone number format
         if phone.startswith('7777'):
             recipient_phone = '78777' + phone[4:]
@@ -117,12 +116,12 @@ async def _send_whatsapp_with_retry(phone: str, message: str) -> bool:
             recipient_phone = '787' + phone[2:]
         else:
             recipient_phone = phone
-        
+
         await whatsapp_client.send_text(recipient_phone, message)
-        logger.info(f"WhatsApp message sent to {recipient_phone} (original: {phone})")
+        logger.info("WhatsApp message sent to %s (original: %s)", recipient_phone, phone)
         return True
     except Exception as e:
-        logger.warning(f"WhatsApp send attempt failed for {phone}: {e}. Will retry if not final attempt.")
+        logger.warning("WhatsApp send attempt failed for %s: %s. Will retry if not final attempt.", phone, e)
         raise
 
 
@@ -279,31 +278,29 @@ def process_whatsapp_inbound(
                 )
 
             elif parsed.intent == "schedule_notification":
-                # Schedule a custom notification
-                from datetime import datetime, timedelta
-                
-                # Extract the message (remove notification keywords)
-                notification_keywords = ["уведоми", "напомни", "remind", "notify", "напоминание", "уведомление"]
-                message_text = text
-                for keyword in notification_keywords:
-                    message_text = message_text.replace(keyword, "").strip()
-                
-                # Parse the time from the message
                 reminder_service = ReminderService(db)
-                
-                notify_time = reminder_service.parse_notification_text(text, user.timezone, now_utc())
-                
+                notify_time = parsed.datetime or reminder_service.parse_notification_text(
+                    text,
+                    user.timezone,
+                    now_utc(),
+                )
+
                 if notify_time:
+                    message_text = reminder_service.extract_notification_message(text)
+
                     # Schedule the notification
                     success = reminder_service.schedule_custom_notification(
                         user_id=user.id,
-                        message=message_text if message_text else "Напоминание",
+                        message=message_text,
                         notify_at=notify_time,
                         title="Напоминание"
                     )
                     
                     if success:
-                        time_str = notify_time.strftime("%d.%m %H:%M")
+                        from app.core.time import resolve_timezone
+
+                        local_time = notify_time.astimezone(resolve_timezone(user.timezone))
+                        time_str = local_time.strftime("%d.%m %H:%M")
                         confirmation = f"✅ Напоминание запланировано на {time_str}! Я напишу вам в это время."
                     else:
                         confirmation = "❌ Не удалось запланировать напоминание. Попробуйте еще раз."
@@ -405,23 +402,14 @@ def process_whatsapp_inbound(
 
             elif parsed.intent == "unknown":
                 # Handle messages that don't contain tasks
-                logger.info("Message intent: %s - no task detected, using chat mode", parsed.intent)
-                try:
-                    # Use Gemini to generate a conversational response
-                    gemini = GeminiClient()
-                    confirmation = asyncio.run(gemini.chat(text, user.timezone))
-                except Exception as e:
-                    logger.error("Chat generation failed: %s", e)
-                    # Fallback to generic help message
-                    confirmation = (
-                        "👋 Привет! Я ваш помощник по задачам.\n\n"
-                        "📝 Я умею:\n"
-                        "• Создавать задачи: 'Купить молоко завтра в 10 утра'\n"
-                        "• Планировать встречи: 'Встреча с клиентом в пятницу 15:00'\n"
-                        "• Показывать задачи: 'мои задачи' или 'повестка'\n"
-                        "• Отмечать выполнение: 'выполнил купить молоко'\n\n"
-                        "💡 Попробуйте написать задачу, и я её запомню!"
-                    )
+                logger.info("Message intent: %s - no task detected", parsed.intent)
+                confirmation = (
+                    "👋 Я здесь. Могу записать задачу, поставить напоминание или показать список задач.\n\n"
+                    "Примеры:\n"
+                    "• Напомни через 10 минут проверить духовку\n"
+                    "• Купить молоко завтра в 10\n"
+                    "• Мои задачи"
+                )
 
             elif parsed.intent == "create_task":
                 # Check if clarification is needed
@@ -518,23 +506,11 @@ def process_whatsapp_inbound(
                     )
 
             else:
-                logger.info("Message intent: %s - using chat mode", parsed.intent)
-                try:
-                    # Use Gemini to generate a conversational response
-                    gemini = GeminiClient()
-                    confirmation = asyncio.run(gemini.chat(text, user.timezone))
-                except Exception as e:
-                    logger.error("Chat generation failed: %s", e)
-                    # Fallback to generic help message
-                    confirmation = (
-                        "👋 Привет! Я ваш помощник по задачам.\n\n"
-                        "📝 Я умею:\n"
-                        "• Создавать задачи: 'Купить молоко завтра в 10 утра'\n"
-                        "• Планировать встречи: 'Встреча с клиентом в пятницу 15:00'\n"
-                        "• Показывать задачи: 'мои задачи' или 'повестка'\n"
-                        "• Отмечать выполнение: 'выполнил купить молоко'\n\n"
-                        "🤔 Что бы вы хотели сделать?"
-                    )
+                logger.info("Message intent: %s - using local fallback", parsed.intent)
+                confirmation = (
+                    "🤔 Не до конца понял. Попробуйте написать проще: "
+                    "'напомни через 10 минут ...', 'купить молоко завтра' или 'мои задачи'."
+                )
 
         except Exception as e:
             logger.error("Error processing message: %s", str(e))
@@ -545,8 +521,6 @@ def process_whatsapp_inbound(
             )
 
         # Send confirmation back to user
-        config = get_settings()
-        
         try:
             # Send with automatic retry on failure
             asyncio.run(_send_whatsapp_with_retry(phone, confirmation))
@@ -561,81 +535,80 @@ def process_whatsapp_inbound(
     finally:
         db.close()
 
-    def _format_daily_agenda(self, agenda: dict) -> str:
-        """Format daily agenda for WhatsApp response."""
-        lines = ["📋 Ваш день сегодня:"]
+def _format_daily_agenda(agenda: dict) -> str:
+    """Format daily agenda for WhatsApp response."""
+    lines = ["📋 Ваш день сегодня:"]
 
-        # Meetings
-        if agenda.get("meetings"):
-            lines.append("\n🌅 Встречи:")
-            for meeting in agenda["meetings"][:5]:  # Limit to 5
-                lines.append(f"• {meeting['start']}-{meeting['end']}: {meeting['title']}")
+    if agenda.get("meetings"):
+        lines.append("\n🌅 Встречи:")
+        for meeting in agenda["meetings"][:5]:
+            lines.append(f"• {meeting['start']}-{meeting['end']}: {meeting['title']}")
 
-        # Today's tasks
-        if agenda.get("tasks_today"):
-            lines.append("\n📝 Задачи на сегодня:")
-            for task in agenda["tasks_today"][:8]:  # Limit to 8
-                priority_emoji = {"high": "🔥", "medium": "⚡", "low": "📝"}.get(task["priority"], "📝")
-                due_info = f" ({task['due_time']})" if task.get("due_time") else ""
-                overdue_marker = " ⏰" if task.get("overdue") else ""
-                lines.append(f"{priority_emoji} {task['title']}{due_info}{overdue_marker}")
+    if agenda.get("tasks_today"):
+        lines.append("\n📝 Задачи на сегодня:")
+        for task in agenda["tasks_today"][:8]:
+            priority_emoji = {"high": "🔥", "medium": "⚡", "low": "📝"}.get(task["priority"], "📝")
+            due_info = f" ({task['due_time']})" if task.get("due_time") else ""
+            overdue_marker = " ⏰" if task.get("overdue") else ""
+            lines.append(f"{priority_emoji} {task['title']}{due_info}{overdue_marker}")
 
-        # Overdue tasks
-        if agenda.get("overdue_tasks"):
-            lines.append("\n❌ Просроченные задачи:")
-            for task in agenda["overdue_tasks"]:
-                days = f" ({task['days_overdue']} дн.)" if task["days_overdue"] > 0 else ""
-                lines.append(f"• {task['title']}{days}")
+    if agenda.get("overdue_tasks"):
+        lines.append("\n❌ Просроченные задачи:")
+        for task in agenda["overdue_tasks"]:
+            days = f" ({task['days_overdue']} дн.)" if task["days_overdue"] > 0 else ""
+            lines.append(f"• {task['title']}{days}")
 
-        # Free slots
-        if agenda.get("free_slots"):
-            lines.append("\n💡 Свободное время:")
-            for slot in agenda["free_slots"]:
-                lines.append(f"• {slot['start']}-{slot['end']} ({slot['duration']})")
+    if agenda.get("free_slots"):
+        lines.append("\n💡 Свободное время:")
+        for slot in agenda["free_slots"]:
+            lines.append(f"• {slot['start']}-{slot['end']} ({slot['duration']})")
 
-        # Workload level
-        workload = agenda.get("workload_level", "moderate")
-        workload_messages = {
-            "light": "🌤️ Легкий день",
-            "moderate": "⚖️ Умеренная нагрузка",
-            "heavy": "🏋️ Загруженный день",
-            "overloaded": "⚠️ Очень загруженный день!"
-        }
-        lines.append(f"\n{workload_messages.get(workload, '⚖️ Умеренная нагрузка')}")
+    workload = agenda.get("workload_level", "moderate")
+    workload_messages = {
+        "light": "🌤️ Легкий день",
+        "moderate": "⚖️ Умеренная нагрузка",
+        "heavy": "🏋️ Загруженный день",
+        "overloaded": "⚠️ Очень загруженный день!",
+    }
+    lines.append(f"\n{workload_messages.get(workload, '⚖️ Умеренная нагрузка')}")
 
-        return "\n".join(lines)
+    return "\n".join(lines)
 
-    def _format_weekly_plan(self, plan: dict) -> str:
-        """Format weekly plan for WhatsApp response."""
-        summary = plan.get("summary", {})
 
-        lines = [f"📅 План на неделю ({summary.get('total_tasks', 0)} задач, {summary.get('total_meetings', 0)} встреч)"]
+def _format_weekly_plan(plan: dict) -> str:
+    """Format weekly plan for WhatsApp response."""
+    summary = plan.get("summary", {})
 
-        # Summary stats
-        lines.append(f"🔥 Важных задач: {summary.get('high_priority_tasks', 0)}")
-        lines.append(f"📊 Среднее встреч в день: {summary.get('avg_daily_meetings', 0)}")
+    lines = [
+        f"📅 План на неделю ({summary.get('total_tasks', 0)} задач, "
+        f"{summary.get('total_meetings', 0)} встреч)"
+    ]
+    lines.append(f"🔥 Важных задач: {summary.get('high_priority_tasks', 0)}")
+    lines.append(f"📊 Среднее встреч в день: {summary.get('avg_daily_meetings', 0)}")
 
-        if summary.get("overloaded_days", 0) > 0:
-            lines.append(f"⚠️ Перегруженных дней: {summary['overloaded_days']}")
+    if summary.get("overloaded_days", 0) > 0:
+        lines.append(f"⚠️ Перегруженных дней: {summary['overloaded_days']}")
 
-        # Daily breakdown (key days only)
-        daily = plan.get("daily_breakdown", {})
-        busy_days = [(day, data) for day, data in daily.items() if data["tasks_count"] > 0 or data["meetings_count"] > 0]
+    daily = plan.get("daily_breakdown", {})
+    busy_days = [
+        (day, data)
+        for day, data in daily.items()
+        if data["tasks_count"] > 0 or data["meetings_count"] > 0
+    ]
 
-        if busy_days:
-            lines.append("\n📋 Ключевые дни:")
-            for day, data in busy_days[:4]:  # Limit to 4 days
-                status = "🔥" if data["high_priority_tasks"] > 0 else "⚡" if data["meetings_count"] > 2 else "📝"
-                lines.append(f"{status} {day}: {data['tasks_count']} задач, {data['meetings_count']} встреч")
+    if busy_days:
+        lines.append("\n📋 Ключевые дни:")
+        for day, data in busy_days[:4]:
+            status = "🔥" if data["high_priority_tasks"] > 0 else "⚡" if data["meetings_count"] > 2 else "📝"
+            lines.append(f"{status} {day}: {data['tasks_count']} задач, {data['meetings_count']} встреч")
 
-        # Recommendations
-        recommendations = plan.get("recommendations", [])
-        if recommendations:
-            lines.append("\n💡 Рекомендации:")
-            for rec in recommendations[:3]:  # Limit to 3
-                lines.append(f"• {rec}")
+    recommendations = plan.get("recommendations", [])
+    if recommendations:
+        lines.append("\n💡 Рекомендации:")
+        for rec in recommendations[:3]:
+            lines.append(f"• {rec}")
 
-        return "\n".join(lines)
+    return "\n".join(lines)
 
 
 @celery_app.task(name="app.workers.jobs.process_email_inbound")
