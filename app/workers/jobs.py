@@ -6,6 +6,7 @@ from typing import Union
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.db.models import (
     CalendarEvent,
@@ -22,6 +23,7 @@ from app.integrations.calendar_google import GoogleCalendarSync
 from app.integrations.email_inbound import EmailInboundParser
 from app.integrations.whatsapp_meta import WhatsAppMetaClient
 from app.schemas.task import TaskCreate
+from app.services.gemini_client import GeminiClient
 from app.services.nlp_pipeline import NLPPipeline
 from app.services.reminder_service import ReminderService
 from app.services.context_manager import ConversationContext
@@ -73,6 +75,57 @@ def _store_inbound(
         return False
 
 
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    retry=retry_if_exception_type((Exception,)),
+)
+async def _parse_message_with_retry(pipeline: "NLPPipeline", text: str, timezone: str, user_id: str = None):
+    """Parse message with automatic retry on failure.
+    
+    Uses tenacity for exponential backoff retry logic to handle
+    transient failures like API rate limits or timeouts.
+    """
+    try:
+        parsed = await pipeline.parse_message(text, timezone, user_id=user_id)
+        return parsed
+    except Exception as e:
+        logger.warning(f"NLP parsing attempt failed: {e}. Will retry if not final attempt.")
+        raise
+
+
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=1, max=3),
+    retry=retry_if_exception_type((Exception,)),
+)
+async def _send_whatsapp_with_retry(phone: str, message: str) -> bool:
+    """Send WhatsApp message with automatic retry on failure.
+    
+    Uses tenacity for exponential backoff retry logic to handle
+    transient failures like API rate limits or network issues.
+    """
+    try:
+        whatsapp_client = WhatsAppMetaClient()
+        
+        # Convert phone number format
+        if phone.startswith('7777'):
+            recipient_phone = '78777' + phone[4:]
+        elif phone.startswith('777'):
+            recipient_phone = '7877' + phone[3:]
+        elif phone.startswith('77'):
+            recipient_phone = '787' + phone[2:]
+        else:
+            recipient_phone = phone
+        
+        await whatsapp_client.send_text(recipient_phone, message)
+        logger.info(f"WhatsApp message sent to {recipient_phone} (original: {phone})")
+        return True
+    except Exception as e:
+        logger.warning(f"WhatsApp send attempt failed for {phone}: {e}. Will retry if not final attempt.")
+        raise
+
+
 @celery_app.task(name="app.workers.jobs.process_whatsapp_inbound")
 def process_whatsapp_inbound(
     external_message_id: str,
@@ -113,7 +166,7 @@ def process_whatsapp_inbound(
                 # Parse the clarification response to extract time/date info
                 # Combine original text with clarification for proper context
                 combined_text = pending_context["original_text"] + " " + text
-                clarification_parsed = asyncio.run(pipeline.parse_message(combined_text, user.timezone))
+                clarification_parsed = asyncio.run(_parse_message_with_retry(pipeline, combined_text, user.timezone))
                 
                 # Use the original task info but update with clarification
                 intent = pending_context["intent"]
@@ -151,8 +204,8 @@ def process_whatsapp_inbound(
                 logger.info("Clarification processed for user %s: task='%s', datetime='%s'", 
                            user.id, title, datetime_obj)
             else:
-                # Normal message processing
-                parsed = asyncio.run(pipeline.parse_message(text, user.timezone, user_id=str(user.id)))
+                # Normal message processing with retry logic
+                parsed = asyncio.run(_parse_message_with_retry(pipeline, text, user.timezone, user_id=str(user.id)))
             logger.info("NLP parsed message: intent='%s', title='%s', datetime='%s'", parsed.intent, parsed.title, parsed.datetime)
             print("Parsed intent:", parsed.intent, "for message:", text)
 
@@ -494,26 +547,12 @@ def process_whatsapp_inbound(
         # Send confirmation back to user
         config = get_settings()
         
-        # Convert sender's phone number to match test recipient format
-        # Examples:
-        # - 77769707106 -> 787769707106
-        # - 77782304206 -> 787782304206
-        # Rule: if starts with 777, add 8 after 777 or 7777
-        if phone.startswith('7777'):
-            recipient_phone = '78777' + phone[4:]
-        elif phone.startswith('777'):
-            recipient_phone = '7877' + phone[3:]
-        elif phone.startswith('77'):
-            recipient_phone = '787' + phone[2:]
-        else:
-            recipient_phone = phone
-        
         try:
-            whatsapp_client = WhatsAppMetaClient()
-            asyncio.run(whatsapp_client.send_text(recipient_phone, confirmation))
-            logger.info("Confirmation sent to %s (original sender: %s): %s", recipient_phone, phone, confirmation)
+            # Send with automatic retry on failure
+            asyncio.run(_send_whatsapp_with_retry(phone, confirmation))
+            logger.info("Confirmation sent to user %s", phone)
         except Exception as e:
-            logger.error("Failed to send confirmation: %s", str(e))
+            logger.error("Failed to send confirmation after retries to %s: %s", phone, str(e))
 
         logger.info("Successfully processed WhatsApp message from %s", phone)
     except Exception as e:

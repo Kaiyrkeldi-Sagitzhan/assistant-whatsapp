@@ -619,16 +619,18 @@ class ReminderService:
     def parse_notification_text(self, text: str, timezone: str, now: datetime) -> Union[datetime, None]:
         """
         Parse natural language notification time from text.
-        Handles formats like:
+        
+        Handles:
         - "через 1 минуту" / "in 1 minute"
-        - "через 30 минут" / "in 30 minutes"
+        - "через 30 минут" / "in 30 minutes"  
         - "через 2 часа" / "in 2 hours"
-        - "в 15:00" / "at 15:00"
-        - "в 15 50" / "at 15 50" (space-separated time)
+        - "в 15:00" / "в 15 часов" / "at 15:00" / "at 3pm"
+        - "в 15 50" / "at 15 50" (space-separated)
         - "за 10 минут до 15:50" / "10 minutes before 15:50"
-        - "напомни за 10 минут в 15:50" / "remind 10 minutes at 15:50"
-        - "В 15 50... напомни за 10 минут" / "At 15:50... remind 10 minutes before"
+        - "В 15 50... напомни за 10 минут"
         - "завтра в 10:00" / "tomorrow at 10:00"
+        
+        IMPORTANT: Now handles hours without minutes (e.g., "в 15 часов" → 15:00)
         
         Returns:
             Parsed datetime or None if cannot parse
@@ -638,12 +640,14 @@ class ReminderService:
         
         text_lower = text.lower().strip()
         
-        # Try "за X минут" pattern combined with a time in the text
-        # e.g., "В 15 50 надо поплакать, напомни за 10 минут" -> 15:40
-        # Also handles singular forms: "за час", "за минуту", "за день" (defaults to 1)
-        before_time_match = re.search(r'за\s+(?:(\d+)\s+)?(минуту|минут|мин|час|часа|часов|день|дня|дней)\s*(?:в|во|до|до\s+вр|к)?\s*(\d{1,2})[:\s](\d{2})', text_lower)
+        # ============ PATTERN 1: "за X минут/часов до HH:MM" ============
+        # e.g., "В 15 50 надо поплакать, напомни за 10 минут" → 15:40
+        # Also handles singular: "за час", "за минуту", "за день" (defaults to 1)
+        before_time_match = re.search(
+            r'за\s+(?:(\d+)\s+)?(минуту|минут|мин|час|часа|часов|день|дня|дней)\s*(?:в|во|до|до\s+вр|к)?\s*(\d{1,2})[:\s](\d{2})',
+            text_lower
+        )
         if before_time_match:
-            # Default to 1 if no number provided (e.g., "за час" = 1 hour)
             value = int(before_time_match.group(1)) if before_time_match.group(1) else 1
             unit = before_time_match.group(2)
             hour = int(before_time_match.group(3))
@@ -662,16 +666,14 @@ class ReminderService:
             elif unit in ["день", "дня", "дней"]:
                 return target - timedelta(days=value)
         
-        # Try "за X минут" with time BEFORE it in the text
+        # ============ PATTERN 2: "за X минут" + separate time mention ============
         # e.g., "В 15 50 надо поплакать, напомни за 10 минут"
-        # Also handles singular forms: "за час", "за минуту", "за день" (defaults to 1)
         time_match_first = re.search(r'(?:в|at|к)\s+(\d{1,2})[:\s](\d{2})', text_lower)
         before_offset_match = re.search(r'за\s+(?:(\d+)\s+)?(минуту|минут|мин|час|часа|часов|день|дня|дней)', text_lower)
         
         if time_match_first and before_offset_match:
             hour = int(time_match_first.group(1))
             minute = int(time_match_first.group(2))
-            # Default to 1 if no number provided (e.g., "за час" = 1 hour)
             value = int(before_offset_match.group(1)) if before_offset_match.group(1) else 1
             unit = before_offset_match.group(2)
             
@@ -688,9 +690,11 @@ class ReminderService:
             elif unit in ["день", "дня", "дней"]:
                 return target - timedelta(days=value)
         
-        # Try relative time parsing first
-        # "через X минуту/минут/часа/часов/дней"
-        relative_match = re.search(r'через\s+(\d+)\s+(минуту|минут|мин|час|часа|часов|день|дня|дней)', text_lower)
+        # ============ PATTERN 3: Relative time "через X" ============
+        relative_match = re.search(
+            r'через\s+(\d+)\s+(минуту|минут|мин|час|часа|часов|день|дня|дней)',
+            text_lower
+        )
         if relative_match:
             value = int(relative_match.group(1))
             unit = relative_match.group(2)
@@ -703,7 +707,10 @@ class ReminderService:
                 return now + timedelta(days=value)
         
         # English relative time
-        relative_match_en = re.search(r'in\s+(\d+)\s+(minute|minutes|min|hour|hours|hr|hrs|day|days)', text_lower)
+        relative_match_en = re.search(
+            r'in\s+(\d+)\s+(minute|minutes|min|hour|hours|hr|hrs|day|days)',
+            text_lower
+        )
         if relative_match_en:
             value = int(relative_match_en.group(1))
             unit = relative_match_en.group(2)
@@ -715,14 +722,22 @@ class ReminderService:
             elif unit in ["day", "days"]:
                 return now + timedelta(days=value)
         
-        # Try absolute time parsing (e.g., "в 15:00", "в 15 50", "at 15:00")
-        # Support both colon and space as separators
-        time_match = re.search(r'(?:в|at|к)\s+(\d{1,2})[:\s](\d{2})', text_lower)
+        # ============ PATTERN 4: Absolute time - поддержка часов без минут ============
+        # "в 15:00" OR "в 15 часов" OR "в 15 часа" OR "в 15"
+        # Regex с опциональными минутами - KEY IMPROVEMENT!
+        time_match = re.search(
+            r'(?:в|at|к)\s+(\d{1,2})(?:[:\s](\d{2}))?\s*(?:часо?в?|часа)?',
+            text_lower
+        )
         if time_match:
             hour = int(time_match.group(1))
-            minute = int(time_match.group(2))
+            minute = int(time_match.group(2)) if time_match.group(2) else 0  # Default to 00 if not specified
             
-            # Convert now to user's timezone for proper time handling
+            # Validate hour
+            if hour > 24:
+                return None
+            
+            # Convert to user's timezone for proper time handling
             from app.core.time import resolve_timezone, to_utc
             local_tz = resolve_timezone(timezone)
             now_local = now.astimezone(local_tz)
@@ -737,7 +752,7 @@ class ReminderService:
             # Convert back to UTC
             return to_utc(target_local, timezone)
         
-        # Try dateutil parser as fallback
+        # ============ PATTERN 5: Try dateutil as fallback ============
         try:
             parsed = date_parser.parse(text, fuzzy=True)
             if parsed > now:

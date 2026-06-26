@@ -24,6 +24,10 @@ class TaskService:
             self.db.add(user)
             self.db.flush()
 
+        if payload.due_at and payload.due_at.tzinfo is None:
+            from app.core.time import to_utc
+            payload = payload.model_copy(update={"due_at": to_utc(payload.due_at, "Asia/Almaty")})
+
         task = Task(
             user_id=payload.user_id,
             title=payload.title,
